@@ -1,13 +1,19 @@
 {
-  "name": "wa-baileys-bot",
+  "name": "wa-bot",
   "version": "1.0.0",
-  "main": "server.js",
+  "description": "WhatsApp Bot Server",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.6.0",
-    "node-telegram-bot-api": "^0.66.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "@hapi/boom": "^10.0.1",
+    "pino": "^8.19.0",
+    "express": "^4.19.2",
     "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

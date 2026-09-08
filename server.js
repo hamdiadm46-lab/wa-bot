@@ -8,28 +8,24 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// قاعدة البيانات المؤقتة في الذاكرة
-const db = {
+let db = {
     accounts: [],       // { phone, letter, index, message, scheduleTime, currentIndex }
     links: [],          // روابط عامة للانضمام
     joinedLinks: [],    // تم الانضمام بنجاح
     pendingLinks: [],   // روابط تتطلب طلب انضمام
-    extractedLinks: [], // الروابط المستخرجة من الجروبات
-    failedLinks: [],    // الأخطاء
+    extractedLinks: [], // الروابط المستخرجة من الجروبات (آخر 48 ساعة)
+    failedLinks: [],    // أخطاء
     isRunning: false,
     isPublishing: false
 };
 
 const activeSockets = {};
 const pairingCodes = {};
-const LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
 
-// دالة لتوليد تأخير عشوائي بين الثواني
 function getRandomDelay(minSec, maxSec) {
     return Math.floor(Math.random() * (maxSec - minSec + 1) + minSec) * 1000;
 }
 
-// دالة اتصال حساب واتساب
 async function connectWhatsAppAccount(phone) {
     const authFolder = `./auth_${phone}`;
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
@@ -52,26 +48,25 @@ async function connectWhatsAppAccount(phone) {
     });
 
     if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
+        try {
+            setTimeout(async () => {
                 const code = await sock.requestPairingCode(phone);
                 pairingCodes[phone] = code;
-            } catch (e) {
-                console.error(`خطأ في طلب كود الربط للرقم ${phone}:`, e);
-            }
-        }, 3000);
+            }, 3000);
+        } catch (e) {
+            console.log('خطأ في طلب كود الربط:', e);
+        }
     }
     return sock;
 }
 
-// دالة الانضمام التلقائي للمجموعات
+// دالة الانضمام التلقائي (التعامل مع طلبات الانضمام والروابط العادية)
 async function startAutomation() {
     if (!db.isRunning || db.accounts.length === 0 || db.links.length === 0) return;
 
     for (let acc of db.accounts) {
         if (!db.isRunning) break;
         let sock = activeSockets[acc.phone];
-        
         if (!sock) {
             sock = await connectWhatsAppAccount(acc.phone);
             await new Promise(r => setTimeout(r, 5000));
@@ -84,17 +79,18 @@ async function startAutomation() {
 
             const cleanLink = link.trim();
             const match = cleanLink.match(/chat\.whatsapp\.com\/([0-9A-Za-z_-]{20,})/);
-            
             if (!match) {
                 db.failedLinks.unshift({ link: cleanLink, error: 'رابط غير صالح' });
                 continue;
             }
 
             try {
+                // محاولة الانضمام
                 await sock.groupAcceptInvite(match[1]);
                 db.joinedLinks.unshift({ link: cleanLink, phone: acc.phone });
             } catch (err) {
                 const msg = err.message || '';
+                // إذا تطلب الرابط طلب انضمام (Approval)
                 if (msg.includes('approval') || msg.includes('admin') || msg.includes('request')) {
                     if (!db.pendingLinks.find(p => p.link === cleanLink)) {
                         db.pendingLinks.unshift({ link: cleanLink, phone: acc.phone });
@@ -109,7 +105,7 @@ async function startAutomation() {
     db.isRunning = false;
 }
 
-// دالة النشر التلقائي في المجموعات
+// دالة النشر التلقائي في المجموعات (بين كل جروب وجروب 20 ثانية)
 async function startPublishing() {
     if (!db.isPublishing) return;
 
@@ -126,19 +122,19 @@ async function startPublishing() {
                 if (!db.isPublishing) break;
                 try {
                     await sock.sendMessage(gId, { text: acc.message });
-                    await new Promise(r => setTimeout(r, 20000)); // 20 ثانية بين كل مجموعة
+                    await new Promise(r => setTimeout(r, 20000)); // 20 ثانية بين كل جروب
                 } catch (e) {
-                    console.error('خطأ في إرسال الرسالة للمجموعة:', e);
+                    console.log('خطأ في إرسال الرسالة لجروب:', e);
                 }
             }
         } catch (e) {
-            console.error('خطأ في جلب مجموعات الحساب:', e);
+            console.log('خطأ في جلب مجموعات الحساب:', e);
         }
     }
     db.isPublishing = false;
 }
 
-// دالة استخراج روابط المجموعات (آخر 48 ساعة)
+// دالة استخراج روابط الجروبات لآخر 48 ساعة
 async function extractUserGroups() {
     const twoDaysAgo = Date.now() - (48 * 60 * 60 * 1000);
     for (let acc of db.accounts) {
@@ -148,8 +144,10 @@ async function extractUserGroups() {
             const chats = await sock.groupFetchAllParticipating();
             for (let gId in chats) {
                 const group = chats[gId];
+                // التحقق من النشاط أو الإنشاء خلال آخر 48 ساعة إن توفرت البيانات
                 const createdTime = (group.creation || 0) * 1000;
                 if (createdTime === 0 || createdTime >= twoDaysAgo) {
+                    // توليد أو محاولة جلب رابط الدعوة إن أمكن أو تخزين معرف المجموعة كمرجع
                     const inviteLink = `https://chat.whatsapp.com/${gId}`;
                     if (!db.extractedLinks.includes(inviteLink)) {
                         db.extractedLinks.push(inviteLink);
@@ -157,12 +155,10 @@ async function extractUserGroups() {
                 }
             }
         } catch (e) {
-            console.error('خطأ في استخراج المجموعات:', e);
+            console.log('خطأ في استخراج المجموعات:', e);
         }
     }
 }
-
-// --- مسارات الخادم (API Routes) ---
 
 app.get(['/', '/api/status'], (req, res) => {
     res.send(`
@@ -215,13 +211,13 @@ app.get(['/', '/api/status'], (req, res) => {
             </div>
 
             <div class="card">
-                <h3>الحسابات المضافة</h3>
+                <h3>الحسابات المضافة (اضغط على الرمز لإظهار الرقم)</h3>
                 <div id="accountsGrid" class="accounts-grid">جاري التحميل...</div>
                 <div id="accountControls" style="margin-top: 12px; display:none;" class="card" style="background:#0f172a;">
                     <p id="selectedAccText" style="font-weight:bold; color:#38bdf8; margin-top:0;"></p>
                     <button class="btn btn-red" onclick="deleteActiveAccount()">حذف الحساب</button>
                     <button class="btn btn-blue" onclick="setAccountMessage()">إضافة / تعديل النشرة</button>
-                    <button class="btn btn-green" onclick="setAccountSchedule()">جدولة النشر</button>
+                    <button class="btn btn-green" onclick="setAccountSchedule()">جدولة النشر (وقت/0)</button>
                 </div>
             </div>
 
@@ -233,22 +229,22 @@ app.get(['/', '/api/status'], (req, res) => {
 
             <div class="card">
                 <h3>النتائج والسجلات</h3>
-                <p style="color:var(--success);">✅ تم الانضمام:</p>
-                <ul id="joinedList"></ul>
+                <p style="color:var(--success);">✅ تم الانضمام (${db.joinedLinks.length}):</p>
+                <ul>${db.joinedLinks.map(i => `<li>[${i.phone}] ${i.link}</li>`).join('') || '<li>لا توجد نتائج</li>'}</ul>
 
-                <p style="color:#f59e0b; margin-top:8px;">⏳ روابط طلبات الانضمام:</p>
-                <div class="link-box" onclick="downloadTxt('pending')">📥 تحميل روابط طلبات الانضمام (txt)</div>
-                <ul id="pendingList"></ul>
+                <p style="color:#f59e0b; margin-top:8px;">⏳ روابط طلبات الانضمام (${db.pendingLinks.length}):</p>
+                <div class="link-box" onclick="downloadTxt('pending')">📥 اضغط لتحميل روابط طلبات الانضمام (txt)</div>
+                <ul>${db.pendingLinks.map(i => `<li>[${i.phone}] ${i.link}</li>`).join('') || '<li>لا توجد طلبات</li>'}</ul>
 
-                <p style="color:#38bdf8; margin-top:8px;">🔗 روابط الجروبات المستخرجة:</p>
-                <div class="link-box" onclick="downloadTxt('extracted')">📥 تحميل الروابط المستخرجة العامة (txt)</div>
+                <p style="color:#38bdf8; margin-top:8px;">🔗 روابط الجروبات المستخرجة (آخر 48 ساعة):</p>
+                <div class="link-box" onclick="downloadTxt('extracted')">📥 اضغط لتحميل الروابط المستخرجة العامة (txt)</div>
             </div>
 
             <div class="card">
                 <h3>التحكم العام والمهام</h3>
                 <button class="btn btn-green" onclick="startProcess()">تشغيل عمليات الانضمام والنشر</button>
                 <button class="btn btn-red" onclick="stopProcess()" style="margin-top:6px;">إيقاف العمليات</button>
-                <button class="btn btn-blue" onclick="extractGroups()" style="margin-top:6px;">استخراج روابط الجروبات (48 ساعة)</button>
+                <button class="btn btn-blue" onclick="extractGroups()" style="margin-top:6px;">استخراج روابط الجروبات (آخر 48 ساعة)</button>
             </div>
         </div>
 
@@ -290,17 +286,14 @@ app.get(['/', '/api/status'], (req, res) => {
                         });
                     }
                     document.getElementById('accountsGrid').innerHTML = gridHtml;
-
-                    // تحديث القوائم
-                    document.getElementById('joinedList').innerHTML = data.joinedLinks.map(i => \`<li>[\${i.phone}] \${i.link}</li>\`).join('') || '<li>لا توجد نتائج</li>';
-                    document.getElementById('pendingList').innerHTML = data.pendingLinks.map(i => \`<li>[\${i.phone}] \${i.link}</li>\`).join('') || '<li>لا توجد طلبات</li>';
                 });
             }
 
             function selectAcc(phone, letter) {
                 selectedPhone = phone;
                 document.getElementById('accountControls').style.display = 'block';
-                document.getElementById('selectedAccText').innerText = \`الحساب المختار: الحرف \${letter} | الرقم: \${phone}\`;
+                document.getElementById('selectedAccText.innerHTML' = `الحساب المختار: الحرف \${letter} | الرقم: \${phone}`);
+                document.getElementById('selectedAccText').innerText = `الحساب المختار: الحرف ${letter} | الرقم: ${phone}`;
             }
 
             function addAccount() {
@@ -310,11 +303,7 @@ app.get(['/', '/api/status'], (req, res) => {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ phone })
-                }).then(() => { 
-                    document.getElementById('accPhone').value = ''; 
-                    loadData(); 
-                    alert('جاري إضافة الحساب وتوليد كود الربط إن لم يكن مسجلاً'); 
-                });
+                }).then(() => { document.getElementById('accPhone').value = ''; loadData(); alert('جاري إضافة الحساب وتوليد كود الربط إن لم يكن مسجلاً'); });
             }
 
             function deleteActiveAccount() {
@@ -358,7 +347,7 @@ app.get(['/', '/api/status'], (req, res) => {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ links })
-                }).then(() => { document.getElementById('linksInput').value = ''; alert('تم حفظ الروابط'); });
+                }).then(() => { document.getElementById('linksInput').value = ''; alert('تم حفظ الروابط'); location.reload(); });
             }
 
             function startProcess() {
@@ -370,7 +359,10 @@ app.get(['/', '/api/status'], (req, res) => {
             }
 
             function extractGroups() {
-                fetch('/api/extract-groups', { method: 'POST' }).then(res => res.json()).then(() => alert('تم استخراج روابط الجروبات بنجاح!'));
+                fetch('/api/extract-groups', { method: 'POST' }).then(res => res.json()).then(d => {
+                    alert('تم استخراج روابط الجروبات بنجاح!');
+                    location.reload();
+                });
             }
 
             function downloadTxt(type) {
@@ -381,6 +373,8 @@ app.get(['/', '/api/status'], (req, res) => {
     </html>
     `);
 });
+
+const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
 
 app.get('/api/get-data', (req, res) => {
     const accs = db.accounts.map(acc => ({
@@ -393,7 +387,7 @@ app.get('/api/get-data', (req, res) => {
 app.post('/api/add-account', async (req, res) => {
     const { phone } = req.body;
     if (phone && !db.accounts.find(a => a.phone === phone)) {
-        const letter = LETTERS[db.accounts.length % LETTERS.length];
+        const letter = letters[db.accounts.length % letters.length];
         db.accounts.push({
             phone,
             letter,
@@ -409,8 +403,6 @@ app.post('/api/add-account', async (req, res) => {
 app.post('/api/delete-account', (req, res) => {
     const { phone } = req.body;
     db.accounts = db.accounts.filter(a => a.phone !== phone);
-    delete activeSockets[phone];
-    delete pairingCodes[phone];
     res.json({ success: true });
 });
 
@@ -455,6 +447,7 @@ app.post('/api/stop', (req, res) => {
     res.json({ success: true, message: 'تم إيقاف العمليات.' });
 });
 
+// تحميل الملفات بصيغة txt
 app.get('/api/download/:type', (req, res) => {
     const type = req.params.type;
     let dataList = [];

@@ -20,6 +20,13 @@ let db = {
 const activeSockets = {};
 const pairingCodes = {};
 
+// دالة لتوليد وقت انتظار عشوائي بين 30 إلى 60 ثانية
+function getRandomDelay() {
+    const min = 30000; // 30 ثانية
+    const max = 60000; // 60 ثانية
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
 async function connectWhatsAppAccount(phone) {
     const authFolder = `./auth_${phone}`;
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
@@ -41,18 +48,14 @@ async function connectWhatsAppAccount(phone) {
             if (shouldReconnect) {
                 connectWhatsAppAccount(phone);
             }
-        } else if (connection === 'open') {
-            console.log(`تم الاتصال بنجاح للحساب: ${phone}`);
         }
     });
 
-    // إذا لم يكن مسجلاً، نولد كود ربط برقم الهاتف إذا طلب
     if (!sock.authState.creds.registered) {
         try {
             setTimeout(async () => {
                 const code = await sock.requestPairingCode(phone);
                 pairingCodes[phone] = code;
-                console.log(`كود الربط للحساب ${phone}: ${code}`);
             }, 3000);
         } catch (e) {
             console.log('خطأ في طلب كود الربط:', e);
@@ -62,7 +65,7 @@ async function connectWhatsAppAccount(phone) {
     return sock;
 }
 
-// دالة الأتمتة الحقيقية
+// دالة الأتمتة مع الفاصل الزمني الآمن (30 إلى 60 ثانية)
 async function startAutomation() {
     if (!db.isRunning || db.accounts.length === 0 || db.links.length === 0) return;
 
@@ -108,7 +111,11 @@ async function startAutomation() {
                     }
                 }
                 
-                await new Promise(resolve => setTimeout(resolve, 4000));
+                // فاصل زمني آمن عشوائي بين 30 إلى 60 ثانية لكل رابط
+                const delay = getRandomDelay();
+                console.log(`انتظار لمدة ${delay / 1000} ثانية قبل الانتقال للرابط التالي...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+
             } catch (e) {
                 db.failedLinks.unshift({ link, error: e.message || 'خطأ غير معروف' });
             }
@@ -183,8 +190,8 @@ app.get(['/', '/api/status'], (req, res) => {
 
         <div class="card">
             <h3>التحكم</h3>
-            <button class="btn btn-green" onclick="startProcess()">تشغيل (30 رابط لكل حساب دورياً)</button>
-            <button class="btn btn-red" onclick="stopProcess()">إيقاف العمليات</button>
+            <button class="btn-green" class="btn" style="width:100%; padding:12px; border:none; border-radius:8px; font-weight:bold; color:white; background:#10b981; cursor:pointer;" onclick="startProcess()">تشغيل (30 رابط لكل حساب دورياً)</button>
+            <button class="btn-red" class="btn" style="width:100%; padding:12px; border:none; border-radius:8px; font-weight:bold; color:white; background:#ef4444; cursor:pointer; margin-top:8px;" onclick="stopProcess()">إيقاف العمليات</button>
         </div>
 
         <script>
@@ -199,7 +206,7 @@ app.get(['/', '/api/status'], (req, res) => {
                                 <span>📱 \${acc.phone}<br>
                                 <small style="color:#38bdf8;">كود الربط: <b>\${acc.pairingCode || 'جاري توليده...'}</b></small><br>
                                 <small style="color:#9ca3af;">وصل للرابط رقم: \${acc.currentIndex}</small></span>
-                                <button class="btn-red" style="padding:4px 8px; font-size:12px; border-radius:4px; border:none;" onclick="deleteAccount(\${index})">حذف</button>
+                                <button class="btn-red" style="padding:4px 8px; font-size:12px; border-radius:4px; border:none; background:#ef4444; color:white;" onclick="deleteAccount(\${index})">حذف</button>
                             </div>\`;
                         });
                     }
@@ -263,7 +270,6 @@ app.get(['/', '/api/status'], (req, res) => {
 });
 
 app.get('/api/get-data', (req, res) => {
-    // دمج كود الربط مع بيانات الحسابات لعرضه في التطبيق
     const updatedAccounts = db.accounts.map(acc => ({
         ...acc,
         pairingCode: pairingCodes[acc.phone] || null
@@ -306,7 +312,7 @@ app.post('/api/start', (req, res) => {
     
     db.isRunning = true;
     startAutomation();
-    res.json({ success: true, message: 'بدأت عملية الانضمام الحقيقي!' });
+    res.json({ success: true, message: 'بدأت عملية الانضمام بفاصل زمني آمن (30-60 ثانية)!' });
 });
 
 app.post('/api/stop', (req, res) => {

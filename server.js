@@ -2,6 +2,7 @@ import express from 'express';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
+import fs from 'fs';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,77 +10,99 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 let db = {
-    accounts: [], // أرقام الحسابات المضافة
-    links: [],    // جميع الروابط المخزنة (بدون تكرار)
-    joinedLinks: [], // تم الانضمام بنجاح
-    pendingLinks: [], // بانتظار الموافقة
-    failedLinks: [], // الروابط التالفة مع سبب المشكلة
+    accounts: [], 
+    links: [],    
+    joinedLinks: [], 
+    pendingLinks: [], 
+    failedLinks: [], 
     isRunning: false
 };
 
-// خريطة لتخزين جلسات الواتساب النشطة لكل رقم
 const activeSockets = {};
 
-// دالة بدء عملية الانضمام التلقائي والدوري
+// دالة الاتصال الفعلي عبر Baileys لكل حساب مضاف
+async function connectWhatsAppAccount(phone) {
+    const authFolder = `./auth_${phone}`;
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' })
+    });
+
+    activeSockets[phone] = sock;
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                connectWhatsAppAccount(phone);
+            }
+        }
+    });
+
+    return sock;
+}
+
+// دالة الأتمتة الحقيقية للانضمام للمجموعات
 async function startAutomation() {
     if (!db.isRunning || db.accounts.length === 0 || db.links.length === 0) return;
 
     for (let acc of db.accounts) {
         if (!db.isRunning) break;
 
-        // إذا وصل لآخر الروابط، يبدأ دورة جديدة أو يتوقف
         if (acc.currentIndex >= db.links.length) {
-            acc.currentIndex = 0; // إعادة الدورة من البداية
+            acc.currentIndex = 0; 
         }
 
-        // أخذ 30 رابطاً لهذا الحساب
+        let sock = activeSockets[acc.phone];
+        if (!sock) {
+            sock = await connectWhatsAppAccount(acc.phone);
+        }
+
         const batchLinks = db.links.slice(acc.currentIndex, acc.currentIndex + 30);
         
-        // محاكاة الاتصال أو ربط الحساب الفعلي عبر Baileys
         for (let link of batchLinks) {
             if (!db.isRunning) break;
             acc.currentIndex++;
 
             try {
-                // استخراج معرف المجموعة من رابط واتساب
-                const codeMatch = link.match(/chat\.whatsapp\.com\/([0-9A-Za-z_-]{20,})/);
+                const cleanLink = link.trim();
+                const codeMatch = cleanLink.match(/chat\.whatsapp\.com\/([0-9A-Za-z_-]{20,})/);
+                
                 if (!codeMatch) {
-                    db.failedLinks.push({ link, error: 'رابط غير صالح أو صيغة غير صحيحة' });
+                    db.failedLinks.push({ link: cleanLink, error: 'رابط غير صالح أو صيغة غير صحيحة' });
                     continue;
                 }
                 
                 const inviteCode = codeMatch[1];
                 
-                // هنا يتم تنفيذ محاولة الانضمام الفعلي عبر الجلسة النشطة إن وجدت
-                const sock = activeSockets[acc.phone];
-                if (sock) {
-                    try {
-                        await sock.groupAcceptInvite(inviteCode);
-                        db.joinedLinks.push({ link, phone: acc.phone });
-                    } catch (err) {
-                        // التعامل مع أخطاء الروابط (منتهية، مغلقة، أو تتطلب موافقة)
-                        if (err.message && err.message.includes('approval')) {
-                            db.pendingLinks.push({ link, phone: acc.phone });
-                        } else {
-                            db.failedLinks.push({ link, error: err.message || 'فشل الانضمام للمجموعة' });
-                        }
+                try {
+                    await sock.groupAcceptInvite(inviteCode);
+                    db.joinedLinks.push({ link: cleanLink, phone: acc.phone });
+                } catch (err) {
+                    const errMsg = err.message || '';
+                    if (errMsg.includes('approval') || errMsg.includes('admin')) {
+                        db.pendingLinks.push({ link: cleanLink, phone: acc.phone });
+                    } else {
+                        db.failedLinks.push({ link: cleanLink, error: errMsg || 'فشل الانضمام أو الرابط منتهي' });
                     }
-                } else {
-                    // تجريبي في حال لم يتم عمل Pairing code كامل بعد للحساب
-                    db.joinedLinks.push({ link, phone: acc.phone });
                 }
                 
-                // تأخير بسيط بين كل رابط لمنع الحظر
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                // انتظار 5 ثوانٍ بين كل رابط لمنع الحظر
+                await new Promise(resolve => setTimeout(resolve, 5000));
             } catch (e) {
                 db.failedLinks.push({ link, error: e.message || 'خطأ غير معروف' });
             }
         }
     }
-    db.isRunning = false; // توقف بعد انتهاء الدورة الحالية لتحديث البيانات
+    db.isRunning = false;
 }
 
-// صفحة لوحة التحكم المتقدمة في التطبيق
 app.get(['/', '/api/status'], (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -175,7 +198,7 @@ app.get(['/', '/api/status'], (req, res) => {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ phone })
-                }).then(() => { document.getElementById('accPhone').value = ''; loadData(); alert('تم إضافة الحساب'); });
+                }).then(() => { document.getElementById('accPhone').value = ''; loadData(); alert('تم إضافة الحساب بنجاح'); });
             }
 
             function deleteAccount(index) {
@@ -216,7 +239,6 @@ app.get(['/', '/api/status'], (req, res) => {
             }
 
             loadData();
-            // تحديث تلقائي للنتائج كل 5 ثوانٍ
             setInterval(loadData, 5000);
         </script>
     </body>
@@ -230,6 +252,7 @@ app.post('/api/add-account', (req, res) => {
     const { phone } = req.body;
     if (phone && !db.accounts.find(a => a.phone === phone)) {
         db.accounts.push({ phone, currentIndex: 0 });
+        connectWhatsAppAccount(phone);
     }
     res.json({ success: true, accounts: db.accounts });
 });
@@ -259,8 +282,8 @@ app.post('/api/start', (req, res) => {
     if (db.links.length === 0) return res.json({ success: false, message: 'أضف روابط مجموعات أولاً!' });
     
     db.isRunning = true;
-    startAutomation(); // تشغيل الأتمتة في الخلفية
-    res.json({ success: true, message: 'بدأت عملية الانضمام التلقائي بنجاح!' });
+    startAutomation();
+    res.json({ success: true, message: 'بدأت عملية الانضمام الحقيقي بنجاح!' });
 });
 
 app.post('/api/stop', (req, res) => {

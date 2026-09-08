@@ -1,109 +1,199 @@
-const express = require('express');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// ⚠️ استبدل القيم التالية ببياناتك الحقيقية
-const TELEGRAM_TOKEN = '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
-const ADMIN_CHAT_ID = '7640301049';
-const PHONE_NUMBER = '967775890747'; // رقم الواتساب بدون +
+// ------------------- الإعدادات الرئيسية -------------------
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
+const ADMIN_ID = 7640301049;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-let sock = null;
 
-app.get('/', (req, res) => {
-    res.send('WhatsApp & Telegram Bot Service is Active!');
-});
+// قاعدة بيانات مخزنة للتحكم بالأذونات والحسابات
+const DB_FILE = './database.json';
+let db = {
+    approvedUsers: [ADMIN_ID],
+    pendingUsers: [],
+    userAccounts: {} // userChatId -> [account_ids...]
+};
 
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    
-    sock = makeWASocket({
+if (fs.existsSync(DB_FILE)) {
+    try { db = JSON.parse(fs.readFileSync(DB_FILE)); } catch (e) { }
+}
+
+function saveDB() {
+    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+}
+
+// تخزين جلسات الواتساب النشطة في الذاكرة
+// Sessions structure: { "chatId_accountName": socket }
+const waSessions = {};
+
+// ------------------- وظائف الجلسات والواتساب -------------------
+async function startWASession(chatId, accountName = 'main') {
+    const sessionKey = `${chatId}_${accountName}`;
+    const sessionDir = path.join(__dirname, 'sessions', sessionKey);
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+    const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // طلب كود الاقتران إذا لم تكن الأجهزة مرتبطة
-    if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
-                const code = await sock.requestPairingCode(PHONE_NUMBER);
-                bot.sendMessage(ADMIN_CHAT_ID, `🔑 **كود اقتران الواتساب الخاص بك:**\n\`${code}\``, { parse_mode: 'Markdown' });
-            } catch (err) {
-                console.error('Error requesting pairing code:', err);
-            }
-        }, 5000);
-    }
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            bot.sendMessage(ADMIN_CHAT_ID, '⚠️ تم انقطاع الاتصال بالواتساب، جاري إعادة المحاولة...');
-            if (shouldReconnect) connectToWhatsApp();
-        } else if (connection === 'open') {
-            bot.sendMessage(ADMIN_CHAT_ID, '✅ **تم الاتصال بنجاح بالواتساب!** البوت يعمل الآن.');
+        if (qr) {
+            // إرسال QR للتلجرام
+            bot.sendMessage(chatId, `📲 **رمز QR للربط بالحساب: (${accountName})**\nيرجى مسح الرمز من الواتساب:`, {
+                parse_mode: 'Markdown'
+            });
+            // تحويل الرمز لصور أو نص متوافق
         }
-    });
 
-    // الاستماع لرسائل الواتساب الواردة وإرسال إشعار للتلجرام
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type === 'notify') {
-            for (const msg of messages) {
-                if (!msg.key.fromMe) {
-                    const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@g.us', '');
-                    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || 'محتوى غير نصي';
-                    
-                    const alertMsg = `📩 **رسالة واتساب جديدة:**\n👤 **من:** \`${sender}\`\n💬 **الرسالة:** ${text}`;
-                    bot.sendMessage(ADMIN_CHAT_ID, alertMsg, { parse_mode: 'Markdown' });
-                }
+        if (connection === 'open') {
+            bot.sendMessage(chatId, `✅ **تم اتصال حساب الواتساب [${accountName}] بنجاح!**`);
+        } else if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                startWASession(chatId, accountName);
+            } else {
+                bot.sendMessage(chatId, `⚠️ تم تسجيل الخروج من حساب الواتساب [${accountName}].`);
             }
         }
     });
+
+    waSessions[sessionKey] = sock;
+    return sock;
 }
 
-// ----------------- أوامر بوت التلجرام -----------------
+// ------------------- التحقق من الأذونات -------------------
+function isApproved(chatId) {
+    return db.approvedUsers.includes(chatId);
+}
 
-// أمر /start
+// ------------------- قائمة التلجرام التفاعلية -------------------
+function getMainKeyboard(chatId) {
+    const isAdmin = (chatId === ADMIN_ID);
+    const inline_keyboard = [
+        [
+            { text: "📱 حسابات الواتساب", callback_data: "menu_accounts" },
+            { text: "➕ ربط حساب جديد", callback_data: "menu_add_acc" }
+        ],
+        [
+            { text: "📢 نظام النشر والإعلانات", callback_data: "menu_broadcast" },
+            { text: "🔍 نظام الفلترة والمراقبة", callback_data: "menu_monitor" }
+        ],
+        [
+            { text: "📊 حالة النظام والخدمة", callback_data: "menu_status" }
+        ]
+    ];
+
+    if (isAdmin) {
+        inline_keyboard.push([
+            { text: "👑 إدارة المستخدمين والموافقات", callback_data: "admin_users" }
+        ]);
+    }
+
+    return { inline_keyboard };
+}
+
+// ------------------- التعامل مع الأوامر (/start) -------------------
 bot.onText(/\/start/, (msg) => {
-    if (msg.chat.id.toString() !== ADMIN_CHAT_ID) return;
-    bot.sendMessage(msg.chat.id, '🤖 أهلاً بك في لوحة تحكم بوت الواتساب.\n\nالأوامر المتاحة:\n/status - فحص حالة الاتصال\n/send [الرقم] [النص] - إرسال رسالة واتساب');
-});
+    const chatId = msg.chat.id;
 
-// أمر /status
-bot.onText(/\/status/, (msg) => {
-    if (msg.chat.id.toString() !== ADMIN_CHAT_ID) return;
-    if (sock && sock.user) {
-        bot.sendMessage(msg.chat.id, `✅ متصل حالياً برقم: ${sock.user.id.split(':')[0]}`);
-    } else {
-        bot.sendMessage(msg.chat.id, '❌ السيرفر غير متصل بالواتساب حالياً.');
-    }
-});
+    if (!isApproved(chatId)) {
+        if (!db.pendingUsers.includes(chatId)) {
+            db.pendingUsers.push(chatId);
+            saveDB();
 
-// أمر الإرسال /send 967xxxxxxxxx السلام عليكم
-bot.onText(/\/send (\d+) (.+)/, async (msg, match) => {
-    if (msg.chat.id.toString() !== ADMIN_CHAT_ID) return;
-    const targetPhone = match[1] + '@s.whatsapp.net';
-    const messageText = match[2];
-
-    if (sock) {
-        try {
-            await sock.sendMessage(targetPhone, { text: messageText });
-            bot.sendMessage(msg.chat.id, `✅ تم إرسال الرسالة بنجاح إلى \`${match[1]}\``, { parse_mode: 'Markdown' });
-        } catch (err) {
-            bot.sendMessage(msg.chat.id, `❌ فشل إرسال الرسالة: ${err.message}`);
+            // إشعار المالك
+            bot.sendMessage(ADMIN_ID, `🔔 **طلب جديد لاستخدام البوت!**\n\nالمستخدم: ${msg.from.first_name} (@${msg.from.username || 'بدون_معرف'})\nالمعرف (ID): \`${chatId}\``, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [
+                            { text: "✅ موافقة", callback_data: `approve_${chatId}` },
+                            { text: "❌ رفض", callback_data: `reject_${chatId}` }
+                        ]
+                    ]
+                }
+            });
         }
-    } else {
-        bot.sendMessage(msg.chat.id, '❌ الواتساب غير متصل حالياً.');
+
+        return bot.sendMessage(chatId, "⏳ **طلبك قيد المراجعة.**\nيرجى الانتظار حتى يتم قبول حسابك من قبل المالك.");
+    }
+
+    bot.sendMessage(chatId, `🤖 **أهلاً بك في لوحة التحكم الخاصة بك!**\nكل حساباتك وإعداداتك مستقلة تماماً.`, {
+        parse_mode: 'Markdown',
+        reply_markup: getMainKeyboard(chatId)
+    });
+});
+
+// ------------------- التفاعل مع الأزرار الشفافة (Callback Queries) -------------------
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const data = query.data;
+
+    // التعامل مع طلبات الموافقة (خاص بالمالك)
+    if (data.startsWith('approve_') && chatId === ADMIN_ID) {
+        const targetId = parseInt(data.split('_')[1]);
+        if (!db.approvedUsers.includes(targetId)) {
+            db.approvedUsers.push(targetId);
+            db.pendingUsers = db.pendingUsers.filter(id => id !== targetId);
+            saveDB();
+
+            bot.answerCallbackQuery(query.id, { text: "تمت الموافقة بنجاح!" });
+            bot.sendMessage(targetId, "🎉 **تمت الموافقة على استخدامك للبوت!**\nاضغط /start للبدء.");
+            bot.editMessageText(`✅ تم قبول المستخدم \`${targetId}\``, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
+        }
+        return;
+    }
+
+    if (data.startsWith('reject_') && chatId === ADMIN_ID) {
+        const targetId = parseInt(data.split('_')[1]);
+        db.pendingUsers = db.pendingUsers.filter(id => id !== targetId);
+        saveDB();
+
+        bot.answerCallbackQuery(query.id, { text: "تم الرفض." });
+        bot.sendMessage(targetId, "❌ للأسف، تم رفض طلبك لاستخدام البوت.");
+        bot.editMessageText(`❌ تم رفض المستخدم \`${targetId}\``, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
+        return;
+    }
+
+    // التحقق من الأذونات قبل استخدام باقي الخيارات
+    if (!isApproved(chatId)) {
+        return bot.answerCallbackQuery(query.id, { text: "عذراً، الحساب غير معتمد.", show_alert: true });
+    }
+
+    // تنقلات القائمة الشفافة
+    if (data === "menu_status") {
+        bot.answerCallbackQuery(query.id);
+        bot.sendMessage(chatId, "⚙️ **حالة النظام:**\nالنظام يعمل بنجاح على Railway ومستقر.", {
+            parse_mode: 'Markdown',
+            reply_markup: getMainKeyboard(chatId)
+        });
+    } else if (data === "menu_accounts") {
+        bot.answerCallbackQuery(query.id);
+        const userAccs = db.userAccounts[chatId] || [];
+        bot.sendMessage(chatId, `📱 **حسابات الواتساب الخاصة بك:**\n${userAccs.length > 0 ? userAccs.map(a => `- ${a}`).join('\n') : 'لا توجد حسابات مرتبطة حالياً.'}`, {
+            parse_mode: 'Markdown',
+            reply_markup: getMainKeyboard(chatId)
+        });
+    } else if (data === "menu_add_acc") {
+        bot.answerCallbackQuery(query.id);
+        const accId = `acc_${Date.now()}`;
+        if (!db.userAccounts[chatId]) db.userAccounts[chatId] = [];
+        db.userAccounts[chatId].push(accId);
+        saveDB();
+
+        bot.sendMessage(chatId, `🔄 جاري جلب رمز الربط للحساب الجديد...`);
+        startWASession(chatId, accId);
     }
 });
 
-connectToWhatsApp();
-
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+console.log("🚀 Bot is up and running...");

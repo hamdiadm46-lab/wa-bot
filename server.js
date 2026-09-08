@@ -292,7 +292,6 @@ app.get(['/', '/api/status'], (req, res) => {
             function selectAcc(phone, letter) {
                 selectedPhone = phone;
                 document.getElementById('accountControls').style.display = 'block';
-                document.getElementById('selectedAccText.innerHTML' = `الحساب المختار: الحرف \${letter} | الرقم: \${phone}`);
                 document.getElementById('selectedAccText').innerText = `الحساب المختار: الحرف ${letter} | الرقم: ${phone}`;
             }
 

@@ -1,6 +1,5 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
-const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
 
@@ -9,6 +8,11 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAFodYLJ-weYJhR
 const ADMIN_ID = 7640301049;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+// إنشاء مجلد الجلسات إذا لم يكن موجوداً
+if (!fs.existsSync('./sessions')) {
+    fs.mkdirSync('./sessions', { recursive: true });
+}
 
 // قاعدة بيانات مخزنة للتحكم بالأذونات والحسابات
 const DB_FILE = './database.json';
@@ -19,7 +23,11 @@ let db = {
 };
 
 if (fs.existsSync(DB_FILE)) {
-    try { db = JSON.parse(fs.readFileSync(DB_FILE)); } catch (e) { }
+    try { 
+        db = JSON.parse(fs.readFileSync(DB_FILE)); 
+    } catch (e) {
+        console.error("خطأ في قراءة قاعدة البيانات:", e);
+    }
 }
 
 function saveDB() {
@@ -27,7 +35,6 @@ function saveDB() {
 }
 
 // تخزين جلسات الواتساب النشطة في الذاكرة
-// Sessions structure: { "chatId_accountName": socket }
 const waSessions = {};
 
 // ------------------- وظائف الجلسات والواتساب -------------------
@@ -47,19 +54,23 @@ async function startWASession(chatId, accountName = 'main') {
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
+        // إرسال رمز الـ QR مباشرة في الشات فور توليده
         if (qr) {
-            // إرسال QR للتلجرام
-            bot.sendMessage(chatId, `📲 **رمز QR للربط بالحساب: (${accountName})**\nيرجى مسح الرمز من الواتساب:`, {
-                parse_mode: 'Markdown'
-            });
-            // تحويل الرمز لصور أو نص متوافق
+            bot.sendMessage(
+                chatId,
+                `📲 **رمز QR للربط بحساب (${accountName}):**\n\nافتح تطبيق الواتساب > **الأجهزة المرتبطة** > **ربط جهاز**، ثم انسخ كود QR الأدناه لاستخدامه:\n\n\`\`\`\n${qr}\n\`\`\``,
+                { parse_mode: 'Markdown' }
+            );
         }
 
         if (connection === 'open') {
             bot.sendMessage(chatId, `✅ **تم اتصال حساب الواتساب [${accountName}] بنجاح!**`);
         } else if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
             if (shouldReconnect) {
+                console.log(`جاري إعادة الاتصال للجلسة: ${sessionKey}`);
                 startWASession(chatId, accountName);
             } else {
                 bot.sendMessage(chatId, `⚠️ تم تسجيل الخروج من حساب الواتساب [${accountName}].`);
@@ -111,18 +122,22 @@ bot.onText(/\/start/, (msg) => {
             db.pendingUsers.push(chatId);
             saveDB();
 
-            // إشعار المالك
-            bot.sendMessage(ADMIN_ID, `🔔 **طلب جديد لاستخدام البوت!**\n\nالمستخدم: ${msg.from.first_name} (@${msg.from.username || 'بدون_معرف'})\nالمعرف (ID): \`${chatId}\``, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: "✅ موافقة", callback_data: `approve_${chatId}` },
-                            { text: "❌ رفض", callback_data: `reject_${chatId}` }
+            // إشعار المالك بالطلب الجديد
+            bot.sendMessage(
+                ADMIN_ID, 
+                `🔔 **طلب جديد لاستخدام البوت!**\n\nالمستخدم: ${msg.from.first_name || ''} (@${msg.from.username || 'بدون_معرف'})\nالمعرف (ID): \`${chatId}\``, 
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                { text: "✅ موافقة", callback_data: `approve_${chatId}` },
+                                { text: "❌ رفض", callback_data: `reject_${chatId}` }
+                            ]
                         ]
-                    ]
+                    }
                 }
-            });
+            );
         }
 
         return bot.sendMessage(chatId, "⏳ **طلبك قيد المراجعة.**\nيرجى الانتظار حتى يتم قبول حسابك من قبل المالك.");
@@ -165,35 +180,51 @@ bot.on('callback_query', async (query) => {
         return;
     }
 
-    // التحقق من الأذونات قبل استخدام باقي الخيارات
+    // التحقق من الأذونات قبل إتاحة الميزات للمستخدم
     if (!isApproved(chatId)) {
         return bot.answerCallbackQuery(query.id, { text: "عذراً، الحساب غير معتمد.", show_alert: true });
     }
 
-    // تنقلات القائمة الشفافة
+    // التنقل داخل القائمة الشفافة
     if (data === "menu_status") {
         bot.answerCallbackQuery(query.id);
-        bot.sendMessage(chatId, "⚙️ **حالة النظام:**\nالنظام يعمل بنجاح على Railway ومستقر.", {
+        bot.sendMessage(chatId, "⚙️ **حالة النظام:**\nالنظام يعمل بنجاح ومستقر.", {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
     } else if (data === "menu_accounts") {
         bot.answerCallbackQuery(query.id);
         const userAccs = db.userAccounts[chatId] || [];
-        bot.sendMessage(chatId, `📱 **حسابات الواتساب الخاصة بك:**\n${userAccs.length > 0 ? userAccs.map(a => `- ${a}`).join('\n') : 'لا توجد حسابات مرتبطة حالياً.'}`, {
+        const accListText = userAccs.length > 0 
+            ? userAccs.map((a, i) => `${i + 1}. \`${a}\``).join('\n') 
+            : 'لا توجد حسابات مرتبطة حالياً.';
+        
+        bot.sendMessage(chatId, `📱 **حسابات الواتساب الخاصة بك:**\n\n${accListText}`, {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
     } else if (data === "menu_add_acc") {
         bot.answerCallbackQuery(query.id);
-        const accId = `acc_${Date.now()}`;
+        const accId = `acc_${Date.now().toString().slice(-4)}`;
         if (!db.userAccounts[chatId]) db.userAccounts[chatId] = [];
         db.userAccounts[chatId].push(accId);
         saveDB();
 
-        bot.sendMessage(chatId, `🔄 جاري جلب رمز الربط للحساب الجديد...`);
+        bot.sendMessage(chatId, `🔄 **جاري إنشاء الجلسة وجلب رمز الربط للحساب الجديد (\`${accId}\`)...**`, { parse_mode: 'Markdown' });
         startWASession(chatId, accId);
+    } else if (data === "admin_users" && chatId === ADMIN_ID) {
+        bot.answerCallbackQuery(query.id);
+        const approvedList = db.approvedUsers.map(id => `• \`${id}\``).join('\n');
+        const pendingList = db.pendingUsers.length > 0 
+            ? db.pendingUsers.map(id => `• \`${id}\``).join('\n') 
+            : 'لا يوجد طلبات قائمة.';
+
+        bot.sendMessage(
+            chatId, 
+            `👑 **إدارة المستخدمين:**\n\n**المستخدمون المعتمدون:**\n${approvedList}\n\n**طلبات الانتظار:**\n${pendingList}`, 
+            { parse_mode: 'Markdown', reply_markup: getMainKeyboard(chatId) }
+        );
     }
 });
 
-console.log("🚀 Bot is up and running...");
+console.log("🚀 Bot server running successfully...");

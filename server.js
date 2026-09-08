@@ -9,7 +9,6 @@ const ADMIN_ID = 7640301049;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// إنشاء مجلد الجلسات إذا لم يكن موجوداً
 if (!fs.existsSync('./sessions')) {
     fs.mkdirSync('./sessions', { recursive: true });
 }
@@ -19,7 +18,7 @@ const DB_FILE = './database.json';
 let db = {
     approvedUsers: [ADMIN_ID],
     pendingUsers: [],
-    userAccounts: {} // userChatId -> [account_ids...]
+    userAccounts: {}
 };
 
 if (fs.existsSync(DB_FILE)) {
@@ -34,11 +33,10 @@ function saveDB() {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 }
 
-// تخزين جلسات الواتساب النشطة في الذاكرة
 const waSessions = {};
 
-// ------------------- وظائف الجلسات والواتساب -------------------
-async function startWASession(chatId, accountName = 'main') {
+// ------------------- ربط الواتساب عبر كود الهاتف -------------------
+async function startWASessionWithCode(chatId, phoneNumber, accountName) {
     const sessionKey = `${chatId}_${accountName}`;
     const sessionDir = path.join(__dirname, 'sessions', sessionKey);
 
@@ -52,42 +50,51 @@ async function startWASession(chatId, accountName = 'main') {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        // إرسال رمز الـ QR مباشرة في الشات فور توليده
-        if (qr) {
-            bot.sendMessage(
-                chatId,
-                `📲 **رمز QR للربط بحساب (${accountName}):**\n\nافتح تطبيق الواتساب > **الأجهزة المرتبطة** > **ربط جهاز**، ثم انسخ كود QR الأدناه لاستخدامه:\n\n\`\`\`\n${qr}\n\`\`\``,
-                { parse_mode: 'Markdown' }
-            );
-        }
+        const { connection, lastDisconnect } = update;
 
         if (connection === 'open') {
-            bot.sendMessage(chatId, `✅ **تم اتصال حساب الواتساب [${accountName}] بنجاح!**`);
+            bot.sendMessage(chatId, `✅ **تم اتصال حساب الواتساب [${accountName}] بنجاح!**`, { parse_mode: 'Markdown' });
         } else if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             if (shouldReconnect) {
-                console.log(`جاري إعادة الاتصال للجلسة: ${sessionKey}`);
-                startWASession(chatId, accountName);
+                startWASessionWithCode(chatId, phoneNumber, accountName);
             } else {
                 bot.sendMessage(chatId, `⚠️ تم تسجيل الخروج من حساب الواتساب [${accountName}].`);
             }
         }
     });
 
+    // طلب كود الربط المكون من 8 أرقام/حروف إذا لم يكن متصلاً بالفعل
+    if (!sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                // تنظيف رقم الهاتف من الفواصل أو العلامات
+                const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
+                const pairingCode = await sock.requestPairingCode(cleanPhone);
+                
+                // إرسال الكود بتنسيق سينجل كود ليسهل نسخه بالنقر عليه
+                bot.sendMessage(
+                    chatId,
+                    `📱 **كود ربط الحساب (${accountName}):**\n\nاضغط على الكود أدناه لنسخه فوراً:\n\`${pairingCode}\`\n\n**خطوات الربط:**\n1. افتح الواتساب على هاتفك.\n2. اذهب إلى **الأجهزة المرتبطة** > **ربط جهاز**.\n3. اختر **الربط برقم الهاتف** ثم أدخل الكود أعلاه.`,
+                    { parse_mode: 'Markdown' }
+                );
+            } catch (err) {
+                console.error("خطأ أثناء جلب كود الربط:", err);
+                bot.sendMessage(chatId, "❌ حدث خطأ أثناء جلب كود الربط. التأكد من صحة رقم الهاتف وبدء العملية مجدداً.");
+            }
+        }, 3000);
+    }
+
     waSessions[sessionKey] = sock;
     return sock;
 }
 
-// ------------------- التحقق من الأذونات -------------------
 function isApproved(chatId) {
     return db.approvedUsers.includes(chatId);
 }
 
-// ------------------- قائمة التلجرام التفاعلية -------------------
 function getMainKeyboard(chatId) {
     const isAdmin = (chatId === ADMIN_ID);
     const inline_keyboard = [
@@ -113,7 +120,7 @@ function getMainKeyboard(chatId) {
     return { inline_keyboard };
 }
 
-// ------------------- التعامل مع الأوامر (/start) -------------------
+// ------------------- الأوامر والرسائل -------------------
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
 
@@ -122,7 +129,6 @@ bot.onText(/\/start/, (msg) => {
             db.pendingUsers.push(chatId);
             saveDB();
 
-            // إشعار المالك بالطلب الجديد
             bot.sendMessage(
                 ADMIN_ID, 
                 `🔔 **طلب جديد لاستخدام البوت!**\n\nالمستخدم: ${msg.from.first_name || ''} (@${msg.from.username || 'بدون_معرف'})\nالمعرف (ID): \`${chatId}\``, 
@@ -149,12 +155,33 @@ bot.onText(/\/start/, (msg) => {
     });
 });
 
-// ------------------- التفاعل مع الأزرار الشفافة (Callback Queries) -------------------
+// استقبال الأرقام المدخلة لربط الحسابات
+const userStates = {};
+
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    if (text && text.startsWith('/')) return; // تجاهل الأوامر
+
+    if (userStates[chatId] === 'AWAITING_PHONE') {
+        delete userStates[chatId];
+        
+        const accId = `acc_${Date.now().toString().slice(-4)}`;
+        if (!db.userAccounts[chatId]) db.userAccounts[chatId] = [];
+        db.userAccounts[chatId].push(accId);
+        saveDB();
+
+        bot.sendMessage(chatId, `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...`, { parse_mode: 'Markdown' });
+        startWASessionWithCode(chatId, text, accId);
+    }
+});
+
+// ------------------- الأزرار الشفافة -------------------
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
 
-    // التعامل مع طلبات الموافقة (خاص بالمالك)
     if (data.startsWith('approve_') && chatId === ADMIN_ID) {
         const targetId = parseInt(data.split('_')[1]);
         if (!db.approvedUsers.includes(targetId)) {
@@ -180,18 +207,18 @@ bot.on('callback_query', async (query) => {
         return;
     }
 
-    // التحقق من الأذونات قبل إتاحة الميزات للمستخدم
     if (!isApproved(chatId)) {
         return bot.answerCallbackQuery(query.id, { text: "عذراً، الحساب غير معتمد.", show_alert: true });
     }
 
-    // التنقل داخل القائمة الشفافة
-    if (data === "menu_status") {
+    if (data === "menu_add_acc") {
         bot.answerCallbackQuery(query.id);
-        bot.sendMessage(chatId, "⚙️ **حالة النظام:**\nالنظام يعمل بنجاح ومستقر.", {
-            parse_mode: 'Markdown',
-            reply_markup: getMainKeyboard(chatId)
-        });
+        userStates[chatId] = 'AWAITING_PHONE';
+        bot.sendMessage(
+            chatId, 
+            "📞 **يرجى إرسال رقم الواتساب الخاص بك مع رمز الدولة:**\n\nمثال: `967770000000` أو `966500000000`", 
+            { parse_mode: 'Markdown' }
+        );
     } else if (data === "menu_accounts") {
         bot.answerCallbackQuery(query.id);
         const userAccs = db.userAccounts[chatId] || [];
@@ -203,15 +230,12 @@ bot.on('callback_query', async (query) => {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
-    } else if (data === "menu_add_acc") {
+    } else if (data === "menu_status") {
         bot.answerCallbackQuery(query.id);
-        const accId = `acc_${Date.now().toString().slice(-4)}`;
-        if (!db.userAccounts[chatId]) db.userAccounts[chatId] = [];
-        db.userAccounts[chatId].push(accId);
-        saveDB();
-
-        bot.sendMessage(chatId, `🔄 **جاري إنشاء الجلسة وجلب رمز الربط للحساب الجديد (\`${accId}\`)...**`, { parse_mode: 'Markdown' });
-        startWASession(chatId, accId);
+        bot.sendMessage(chatId, "⚙️ **حالة النظام:**\nالنظام يعمل بنجاح ومستقر.", {
+            parse_mode: 'Markdown',
+            reply_markup: getMainKeyboard(chatId)
+        });
     } else if (data === "admin_users" && chatId === ADMIN_ID) {
         bot.answerCallbackQuery(query.id);
         const approvedList = db.approvedUsers.map(id => `• \`${id}\``).join('\n');
@@ -227,4 +251,4 @@ bot.on('callback_query', async (query) => {
     }
 });
 
-console.log("🚀 Bot server running successfully...");
+console.log("🚀 Server is running...");

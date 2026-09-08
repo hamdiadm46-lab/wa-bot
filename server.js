@@ -1,62 +1,54 @@
-const {
-    default: makeWASocket,
+import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const express = require('express');
-const fs = require('fs-extra');
-const path = require('path');
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import express from 'express';
 
 // ==========================================
-// 1. اعدادات خادم الـ API لتطبيق الأندرويد
+// 1. إعدادات خادم الـ API لتطبيق الأندرويد
 // ==========================================
 const app = express();
 app.use(express.json());
 
-// متغيّرات التحكم بحالة البوت
 let botStatus = {
     connected: false,
-    phoneNumber: "967730536867", // قم بتعديله لرقمك مع المفتاح الدولي بدون +
+    phoneNumber: "967730536867", // رقمك مع المفتاح الدولي بدون +
     pairingCode: null,
     monitoringEnabled: true,
     broadcastsCount: 0
 };
 
-// مسار فحص الحالة من التطبيق
 app.get('/api/status', (req, res) => {
     res.json(botStatus);
 });
 
-// مسار استقبال الأوامر من التطبيق
 app.post('/api/command', (req, res) => {
     const { command, text } = req.body;
 
     if (command === 'toggle_monitoring') {
         botStatus.monitoringEnabled = !botStatus.monitoringEnabled;
-        console.log(`[API] تم تغيير حالة المراقبة إلى: ${botStatus.monitoringEnabled}`);
+        console.log(`[API] حالة المراقبة: ${botStatus.monitoringEnabled}`);
         return res.json({ success: true, monitoringEnabled: botStatus.monitoringEnabled });
     }
 
     if (command === 'broadcast') {
         console.log(`[API] طلب إرسال نشرة: ${text}`);
         botStatus.broadcastsCount++;
-        // هنا يمكنك إضافة دالة الدوران على المجموعات والإرسال
         return res.json({ success: true, message: 'جاري تنفيذ النشرة' });
     }
 
     res.status(400).json({ success: false, message: 'أمر غير معروف' });
 });
 
-// تشغيل خادم Express على البورت المحدد من Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 API Server running on port ${PORT}`);
 });
 
 // ==========================================
-// 2. كود اتصال الواتساب (Baileys)
+// 2. كود اتصال الواتساب (Baileys ESM)
 // ==========================================
 async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -65,12 +57,11 @@ async function startBot() {
     const sock = makeWASocket({
         version,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // تعطيل الـ QR واستخدام كود الربط
+        printQRInTerminal: false,
         auth: state,
         browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
-    // توليد كود الربط إذا لم يكن الحساب مسجلاً بعد
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -88,7 +79,6 @@ async function startBot() {
         }, 5000);
     }
 
-    // إدارة أحداث الاتصال
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
 
@@ -106,19 +96,13 @@ async function startBot() {
         }
     });
 
-    // حفظ بيانات الجلسة عند التحديث
     sock.ev.on('creds.update', saveCreds);
 
-    // الاستماع للرسائل القادمة
     sock.ev.on('messages.upsert', async (m) => {
         if (!botStatus.monitoringEnabled) return;
-        
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
-
-        // يمكنك إضافة منطق قراءة كلمات الفلتر والانضمام المباشر هنا
     });
 }
 
-// بدء تشغيل البوت
 startBot();

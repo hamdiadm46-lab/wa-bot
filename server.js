@@ -1,13 +1,20 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAEm7odPf8fk7O119NBczvYGw_tVjl0sO30';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAEwCvDhURuxBhA4fW3SPvz1qLfjF_WSyYw';
 const ADMIN_ID = 7640301049;
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// إيقاف إظهار خطأ Polling في الكونسول حتى لا يتسبب في إعادة التشغيل
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: { autoStart: true, params: { timeout: 10 } } });
+
+bot.on('polling_error', (error) => {
+    if (error.code === 'ETELEGRAM' && error.message.includes('409 Conflict')) {
+        console.log('⚠️ تداخل مؤقت في الجلسات، جاري التجاهل...');
+    }
+});
 
 if (!fs.existsSync('./sessions')) {
     fs.mkdirSync('./sessions', { recursive: true });
@@ -37,13 +44,11 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
     const sessionKey = `${chatId}_${accountName}`;
     const sessionDir = path.join(__dirname, 'sessions', sessionKey);
 
-    // إغلاق أي جلسة قديمة مسجلة للحد من التكرار
     if (waSessions[sessionKey]) {
         try { waSessions[sessionKey].end(); } catch (e) {}
         delete waSessions[sessionKey];
     }
 
-    // إزالة مجلد الجلسة لضمان توليد مفتاح تشفير جديد
     if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -57,11 +62,12 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
             auth: state,
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
-            browser: Browsers.macOS("Desktop"),
+            // المتصفح الرسمي لضمان قبول Pairing Code دون رفض Couldn't link device
+            browser: ["Chrome (Linux)", "Chrome", "121.0.6167.160"],
             syncFullHistory: false,
+            markOnlineOnConnect: true,
             connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 20000
+            defaultQueryTimeoutMs: 60000
         });
 
         waSessions[sessionKey] = sock;
@@ -77,14 +83,12 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
                 });
             } else if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-                // إعادة الاتصال فقط إذا كان الحساب مسجلاً ومقترناً بالفعل وليس أثناء طلب الكود
                 if (statusCode !== DisconnectReason.loggedOut && sock.authState.creds.registered) {
                     startWASessionWithCode(chatId, phoneNumber, accountName);
                 }
             }
         });
 
-        // طلب كود الربط مرة واحدة فقط دون تكرار
         if (!sock.authState.creds.registered) {
             setTimeout(async () => {
                 try {
@@ -93,17 +97,17 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
 
                     bot.sendMessage(
                         chatId,
-                        `📱 **كود الربط المخصص لك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود أعلاه لنسخه فوراً)*\n\n⚠️ **تنبيه:** أدخل هذا الكود في تطبيق الواتساب الآن دون تأخير.`,
+                        `📱 **كود الربط الخاص بك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود لنسخه)*\n\n⚠️ **هام:** أدخل الكود في الواتساب فوراً قبل انقضاء 30 ثانية.`,
                         { parse_mode: 'Markdown', ...cancelKeyboard }
                     );
                 } catch (err) {
                     bot.sendMessage(
                         chatId, 
-                        `❌ **خطأ أثناء طلب الكود:**\n\`${err.message || err}\``,
+                        `❌ **تعذر طلب الكود من واتساب:**\n\`${err.message || err}\`\n\nتأكد أن رقم الهاتف مكتوب صح مع رمز الدولة بدون (+) وأن الرقم ليس عليه حظر ربط مؤقت.`,
                         { parse_mode: 'Markdown', reply_markup: getMainKeyboard(chatId) }
                     );
                 }
-            }, 3000);
+            }, 4000);
         }
     } catch (e) {
         bot.sendMessage(chatId, `⚠️ **خطأ في السيرفر:**\n\`${e.message}\``, { parse_mode: 'Markdown' });
@@ -171,7 +175,7 @@ bot.on('message', async (msg) => {
 
         bot.sendMessage(
             chatId, 
-            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...\nجهز الواتساب الآن.`, 
+            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...\nجهز تطبيق الواتساب الآن.`, 
             { parse_mode: 'Markdown', ...cancelKeyboard }
         );
         startWASessionWithCode(chatId, text, accId);

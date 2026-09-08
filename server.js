@@ -8,14 +8,14 @@ app.use(express.json());
 
 let botStatus = {
     connected: false,
-    phoneNumber: "966547420621",
+    phoneNumber: "967775890747",
     pairingCode: null,
     monitoringEnabled: true,
     broadcastsCount: 0
 };
 
-// 1. الصفحة الرئيسية (لوحة التحكم التفاعلية للـ APK)
-app.get('/', (req, res) => {
+// عرض لوحة التحكم سواء فتح الرابط الرئيسي أو /api/status
+app.get(['/', '/api/status'], (req, res) => {
     res.send(`
     <!DOCTYPE html>
     <html lang="ar" dir="rtl">
@@ -82,17 +82,7 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 2. واجهات الـ API للتحكم من اللوحة
-// عرض لوحة التحكم سواء فتح الرابط الرئيسي أو /api/status
-app.get(['/', '/api/status'], (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="ar" dir="rtl">
-    ... (بقية كود الـ HTML)
-    `);
-});
-
-
+// واجهات الـ API للتحكم من اللوحة
 app.post('/api/toggle-monitoring', (req, res) => {
     botStatus.monitoringEnabled = !botStatus.monitoringEnabled;
     res.json({ success: true, monitoringEnabled: botStatus.monitoringEnabled });

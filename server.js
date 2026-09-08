@@ -1,9 +1,8 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 
-// ------------------- الإعدادات الرئيسية -------------------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
 const ADMIN_ID = 7640301049;
 
@@ -13,20 +12,11 @@ if (!fs.existsSync('./sessions')) {
     fs.mkdirSync('./sessions', { recursive: true });
 }
 
-// قاعدة بيانات مخزنة للتحكم بالأذونات والحسابات
 const DB_FILE = './database.json';
-let db = {
-    approvedUsers: [ADMIN_ID],
-    pendingUsers: [],
-    userAccounts: {}
-};
+let db = { approvedUsers: [ADMIN_ID], pendingUsers: [], userAccounts: {} };
 
 if (fs.existsSync(DB_FILE)) {
-    try { 
-        db = JSON.parse(fs.readFileSync(DB_FILE)); 
-    } catch (e) {
-        console.error("خطأ في قراءة قاعدة البيانات:", e);
-    }
+    try { db = JSON.parse(fs.readFileSync(DB_FILE)); } catch (e) {}
 }
 
 function saveDB() {
@@ -35,16 +25,18 @@ function saveDB() {
 
 const waSessions = {};
 
-// ------------------- ربط الواتساب عبر كود الهاتف -------------------
 async function startWASessionWithCode(chatId, phoneNumber, accountName) {
     const sessionKey = `${chatId}_${accountName}`;
     const sessionDir = path.join(__dirname, 'sessions', sessionKey);
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
+        version,
         auth: state,
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -56,9 +48,7 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
             bot.sendMessage(chatId, `✅ **تم اتصال حساب الواتساب [${accountName}] بنجاح!**`, { parse_mode: 'Markdown' });
         } else if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
-            if (shouldReconnect) {
+            if (statusCode !== DisconnectReason.loggedOut) {
                 startWASessionWithCode(chatId, phoneNumber, accountName);
             } else {
                 bot.sendMessage(chatId, `⚠️ تم تسجيل الخروج من حساب الواتساب [${accountName}].`);
@@ -66,25 +56,25 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
         }
     });
 
-    // طلب كود الربط المكون من 8 أرقام/حروف إذا لم يكن متصلاً بالفعل
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
-                // تنظيف رقم الهاتف من الفواصل أو العلامات
                 const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
                 const pairingCode = await sock.requestPairingCode(cleanPhone);
                 
-                // إرسال الكود بتنسيق سينجل كود ليسهل نسخه بالنقر عليه
+                // إضافة المبدل لتنسيق الكود بشكل مقروء (مثال: ABCD-1234)
+                const formattedCode = pairingCode?.match(/.{1,4}/g)?.join('-') || pairingCode;
+
                 bot.sendMessage(
                     chatId,
-                    `📱 **كود ربط الحساب (${accountName}):**\n\nاضغط على الكود أدناه لنسخه فوراً:\n\`${pairingCode}\`\n\n**خطوات الربط:**\n1. افتح الواتساب على هاتفك.\n2. اذهب إلى **الأجهزة المرتبطة** > **ربط جهاز**.\n3. اختر **الربط برقم الهاتف** ثم أدخل الكود أعلاه.`,
+                    `📱 **كود ربط الحساب المخصص لك:**\n\n\`${formattedCode}\`\n\n*(اضغط على الكود أعلاه لنسخه فوراً)*\n\n**طريقة التفعيل:**\n1. افتح الواتساب على هاتفك.\n2. اذهب إلى **الأجهزة المرتبطة** > **ربط جهاز**.\n3. اختر **الربط برقم الهاتف** ثم أدخل الكود.`,
                     { parse_mode: 'Markdown' }
                 );
             } catch (err) {
-                console.error("خطأ أثناء جلب كود الربط:", err);
-                bot.sendMessage(chatId, "❌ حدث خطأ أثناء جلب كود الربط. التأكد من صحة رقم الهاتف وبدء العملية مجدداً.");
+                console.error("خطأ في جلب الكود:", err);
+                bot.sendMessage(chatId, "❌ لم يتم إصدار الكود. يرجى التأكد من إعادة المحاولة وإدخال الرقم الصحيح مقترناً برمز الدولة بدون علامة (+).");
             }
-        }, 3000);
+        }, 6000);
     }
 
     waSessions[sessionKey] = sock;
@@ -112,15 +102,12 @@ function getMainKeyboard(chatId) {
     ];
 
     if (isAdmin) {
-        inline_keyboard.push([
-            { text: "👑 إدارة المستخدمين والموافقات", callback_data: "admin_users" }
-        ]);
+        inline_keyboard.push([{ text: "👑 إدارة المستخدمين والموافقات", callback_data: "admin_users" }]);
     }
 
     return { inline_keyboard };
 }
 
-// ------------------- الأوامر والرسائل -------------------
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
 
@@ -145,7 +132,6 @@ bot.onText(/\/start/, (msg) => {
                 }
             );
         }
-
         return bot.sendMessage(chatId, "⏳ **طلبك قيد المراجعة.**\nيرجى الانتظار حتى يتم قبول حسابك من قبل المالك.");
     }
 
@@ -155,14 +141,13 @@ bot.onText(/\/start/, (msg) => {
     });
 });
 
-// استقبال الأرقام المدخلة لربط الحسابات
 const userStates = {};
 
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
 
-    if (text && text.startsWith('/')) return; // تجاهل الأوامر
+    if (text && text.startsWith('/')) return;
 
     if (userStates[chatId] === 'AWAITING_PHONE') {
         delete userStates[chatId];
@@ -172,12 +157,11 @@ bot.on('message', async (msg) => {
         db.userAccounts[chatId].push(accId);
         saveDB();
 
-        bot.sendMessage(chatId, `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...`, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `🔄 **جاري الاتصال بخوادم الواتساب وجلب كود الربط للرقم:** \`${text}\`...\nانتظر بضعة ثوانٍ.`, { parse_mode: 'Markdown' });
         startWASessionWithCode(chatId, text, accId);
     }
 });
 
-// ------------------- الأزرار الشفافة -------------------
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
@@ -216,7 +200,7 @@ bot.on('callback_query', async (query) => {
         userStates[chatId] = 'AWAITING_PHONE';
         bot.sendMessage(
             chatId, 
-            "📞 **يرجى إرسال رقم الواتساب الخاص بك مع رمز الدولة:**\n\nمثال: `967770000000` أو `966500000000`", 
+            "📞 **يرجى إرسال رقم الواتساب الخاص بك مع رمز الدولة دون أي مسافات أو أرمز:**\n\nمثال: `966500000000` أو `96770000000`", 
             { parse_mode: 'Markdown' }
         );
     } else if (data === "menu_accounts") {
@@ -251,4 +235,4 @@ bot.on('callback_query', async (query) => {
     }
 });
 
-console.log("🚀 Server is running...");
+console.log("🚀 Server running...");

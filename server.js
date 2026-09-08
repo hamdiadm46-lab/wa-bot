@@ -144,10 +144,8 @@ async function extractUserGroups() {
             const chats = await sock.groupFetchAllParticipating();
             for (let gId in chats) {
                 const group = chats[gId];
-                // التحقق من النشاط أو الإنشاء خلال آخر 48 ساعة إن توفرت البيانات
                 const createdTime = (group.creation || 0) * 1000;
                 if (createdTime === 0 || createdTime >= twoDaysAgo) {
-                    // توليد أو محاولة جلب رابط الدعوة إن أمكن أو تخزين معرف المجموعة كمرجع
                     const inviteLink = `https://chat.whatsapp.com/${gId}`;
                     if (!db.extractedLinks.includes(inviteLink)) {
                         db.extractedLinks.push(inviteLink);
@@ -229,12 +227,12 @@ app.get(['/', '/api/status'], (req, res) => {
 
             <div class="card">
                 <h3>النتائج والسجلات</h3>
-                <p style="color:var(--success);">✅ تم الانضمام (${db.joinedLinks.length}):</p>
-                <ul>${db.joinedLinks.map(i => `<li>[${i.phone}] ${i.link}</li>`).join('') || '<li>لا توجد نتائج</li>'}</ul>
+                <p style="color:var(--success);">✅ تم الانضمام (<span id="joinedCount">0</span>):</p>
+                <ul id="joinedList"><li>لا توجد نتائج</li></ul>
 
-                <p style="color:#f59e0b; margin-top:8px;">⏳ روابط طلبات الانضمام (${db.pendingLinks.length}):</p>
+                <p style="color:#f59e0b; margin-top:8px;">⏳ روابط طلبات الانضمام (<span id="pendingCount">0</span>):</p>
                 <div class="link-box" onclick="downloadTxt('pending')">📥 اضغط لتحميل روابط طلبات الانضمام (txt)</div>
-                <ul>${db.pendingLinks.map(i => `<li>[${i.phone}] ${i.link}</li>`).join('') || '<li>لا توجد طلبات</li>'}</ul>
+                <ul id="pendingList"><li>لا توجد طلبات</li></ul>
 
                 <p style="color:#38bdf8; margin-top:8px;">🔗 روابط الجروبات المستخرجة (آخر 48 ساعة):</p>
                 <div class="link-box" onclick="downloadTxt('extracted')">📥 اضغط لتحميل الروابط المستخرجة العامة (txt)</div>
@@ -286,13 +284,23 @@ app.get(['/', '/api/status'], (req, res) => {
                         });
                     }
                     document.getElementById('accountsGrid').innerHTML = gridHtml;
+
+                    // تحديث القوائم والعدادات بأمان
+                    document.getElementById('joinedCount').innerText = data.joinedLinks.length;
+                    document.getElementById('pendingCount').innerText = data.pendingLinks.length;
+
+                    let joinedHtml = data.joinedLinks.map(i => \`<li>[\${i.phone}] \${i.link}</li>\`).join('');
+                    document.getElementById('joinedList').innerHTML = joinedHtml || '<li>لا توجد نتائج</li>';
+
+                    let pendingHtml = data.pendingLinks.map(i => \`<li>[\${i.phone}] \${i.link}</li>\`).join('');
+                    document.getElementById('pendingList').innerHTML = pendingHtml || '<li>لا توجد طلبات</li>';
                 });
             }
 
             function selectAcc(phone, letter) {
                 selectedPhone = phone;
                 document.getElementById('accountControls').style.display = 'block';
-                document.getElementById('selectedAccText').innerText = `الحساب المختار: الحرف ${letter} | الرقم: ${phone}`;
+                document.getElementById('selectedAccText').innerText = \`الحساب المختار: الحرف \${letter} | الرقم: \${phone}\`;
             }
 
             function addAccount() {

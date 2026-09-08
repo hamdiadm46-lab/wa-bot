@@ -37,7 +37,13 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
     const sessionKey = `${chatId}_${accountName}`;
     const sessionDir = path.join(__dirname, 'sessions', sessionKey);
 
-    // تنظيف ملفات الجلسة القديمة الفاسدة
+    // إغلاق أي جلسة قديمة مسجلة للحد من التكرار
+    if (waSessions[sessionKey]) {
+        try { waSessions[sessionKey].end(); } catch (e) {}
+        delete waSessions[sessionKey];
+    }
+
+    // إزالة مجلد الجلسة لضمان توليد مفتاح تشفير جديد
     if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -51,18 +57,14 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
             auth: state,
             logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
-            // محاكاة نظام متصفح أوبونتو كروم الرسمي لإتاحة الربط برقم الهاتف
-            browser: ["Ubuntu", "Chrome", "120.0.6099.109"],
+            browser: Browsers.macOS("Desktop"),
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 10000,
-            emitOwnEvents: true,
-            retryRequestOptions: {
-                maxRetries: 5
-            }
+            keepAliveIntervalMs: 20000
         });
 
+        waSessions[sessionKey] = sock;
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
@@ -75,16 +77,15 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
                 });
             } else if (connection === 'close') {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-                if (statusCode !== DisconnectReason.loggedOut) {
+                // إعادة الاتصال فقط إذا كان الحساب مسجلاً ومقترناً بالفعل وليس أثناء طلب الكود
+                if (statusCode !== DisconnectReason.loggedOut && sock.authState.creds.registered) {
                     startWASessionWithCode(chatId, phoneNumber, accountName);
-                } else {
-                    bot.sendMessage(chatId, `⚠️ **نتيجة:** تم تسجيل الخروج أو إلغاء ربط الحساب [${accountName}].`);
                 }
             }
         });
 
+        // طلب كود الربط مرة واحدة فقط دون تكرار
         if (!sock.authState.creds.registered) {
-            // انتظار 3 ثوان لتثبيت استجابة الـ WebSocket قبل طلب الكود
             setTimeout(async () => {
                 try {
                     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
@@ -92,20 +93,18 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
 
                     bot.sendMessage(
                         chatId,
-                        `📱 **كود الربط المخصص لك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود أعلاه لنسخه فوراً)*\n\n⚠️ **تنبيه هام جداً:**\n1. افتح تطبيق الواتساب فوراً.\n2. اختر **الأجهزة المرتبطة** > **ربط جهاز** > **الربط برقم الهاتف**.\n3. قم بلصق الكود فوراً بدون تعديل أو تأخير.`,
+                        `📱 **كود الربط المخصص لك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود أعلاه لنسخه فوراً)*\n\n⚠️ **تنبيه:** أدخل هذا الكود في تطبيق الواتساب الآن دون تأخير.`,
                         { parse_mode: 'Markdown', ...cancelKeyboard }
                     );
                 } catch (err) {
                     bot.sendMessage(
                         chatId, 
-                        `❌ **خطأ من واتساب عند طلب الكود:**\n\`${err.message || err}\`\n\nيرجى التأكد من أن الرقم بدون مسافات أو رموز وأن حسابك ليس محظوراً مؤقتاً من الربط.`,
+                        `❌ **خطأ أثناء طلب الكود:**\n\`${err.message || err}\``,
                         { parse_mode: 'Markdown', reply_markup: getMainKeyboard(chatId) }
                     );
                 }
             }, 3000);
         }
-
-        waSessions[sessionKey] = sock;
     } catch (e) {
         bot.sendMessage(chatId, `⚠️ **خطأ في السيرفر:**\n\`${e.message}\``, { parse_mode: 'Markdown' });
     }
@@ -172,7 +171,7 @@ bot.on('message', async (msg) => {
 
         bot.sendMessage(
             chatId, 
-            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...\nجهز تطبيق الواتساب على هاتفك الآن!`, 
+            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...\nجهز الواتساب الآن.`, 
             { parse_mode: 'Markdown', ...cancelKeyboard }
         );
         startWASessionWithCode(chatId, text, accId);

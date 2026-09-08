@@ -83,7 +83,15 @@ app.get('/', (req, res) => {
 });
 
 // 2. واجهات الـ API للتحكم من اللوحة
-app.get('/api/status', (req, res) => res.json(botStatus));
+// عرض لوحة التحكم سواء فتح الرابط الرئيسي أو /api/status
+app.get(['/', '/api/status'], (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl">
+    ... (بقية كود الـ HTML)
+    `);
+});
+
 
 app.post('/api/toggle-monitoring', (req, res) => {
     botStatus.monitoringEnabled = !botStatus.monitoringEnabled;

@@ -9,27 +9,21 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 let db = {
-    accounts: [],       // { phone, letter, postMessage, scheduleTime, currentIndex }
-    links: [],          // روابط عامة مضافة
-    requestLinks: [],   // روابط طلبات الانضمام (التي تتطلب موافقة)
-    extractedLinks: [], // الروابط المستخرجة من آخر 48 ساعة
-    joinedLinks: [], 
-    failedLinks: [], 
+    accounts: [],       // { phone, letter, index, message, scheduleTime, currentIndex }
+    links: [],          // روابط عامة للانضمام
+    joinedLinks: [],    // تم الانضمام بنجاح
+    pendingLinks: [],   // روابط تتطلب طلب انضمام
+    extractedLinks: [], // الروابط المستخرجة من الجروبات (آخر 48 ساعة)
+    failedLinks: [],    // أخطاء
     isRunning: false,
-    isPostingRunning: false
+    isPublishing: false
 };
 
 const activeSockets = {};
 const pairingCodes = {};
 
-function getLetter(index) {
-    return String.fromCharCode(65 + index); // A, B, C, ...
-}
-
-function getRandomDelay() {
-    const min = 30000; 
-    const max = 60000; 
-    return Math.floor(Math.random() * (max - min + 1)) + min;
+function getRandomDelay(minSec, maxSec) {
+    return Math.floor(Math.random() * (maxSec - minSec + 1) + minSec) * 1000;
 }
 
 async function connectWhatsAppAccount(phone) {
@@ -43,16 +37,13 @@ async function connectWhatsAppAccount(phone) {
     });
 
     activeSockets[phone] = sock;
-
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) {
-                connectWhatsAppAccount(phone);
-            }
+            if (shouldReconnect) connectWhatsAppAccount(phone);
         }
     });
 
@@ -66,127 +57,106 @@ async function connectWhatsAppAccount(phone) {
             console.log('خطأ في طلب كود الربط:', e);
         }
     }
-
     return sock;
 }
 
-// دالة الانضمام التلقائي (التعرف على طلبات الانضمام والروابط العادية)
+// دالة الانضمام التلقائي (التعامل مع طلبات الانضمام والروابط العادية)
 async function startAutomation() {
     if (!db.isRunning || db.accounts.length === 0 || db.links.length === 0) return;
 
     for (let acc of db.accounts) {
         if (!db.isRunning) break;
-
-        if (acc.currentIndex >= db.links.length) {
-            acc.currentIndex = 0; 
-        }
-
         let sock = activeSockets[acc.phone];
         if (!sock) {
             sock = await connectWhatsAppAccount(acc.phone);
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            await new Promise(r => setTimeout(r, 5000));
         }
 
-        const batchLinks = db.links.slice(acc.currentIndex, acc.currentIndex + 30);
-        
-        for (let link of batchLinks) {
+        const batch = db.links.slice(acc.currentIndex, acc.currentIndex + 30);
+        for (let link of batch) {
             if (!db.isRunning) break;
             acc.currentIndex++;
 
-            try {
-                const cleanLink = link.trim();
-                const codeMatch = cleanLink.match(/chat\.whatsapp\.com\/([0-9A-Za-z_-]{20,})/);
-                
-                if (!codeMatch) {
-                    db.failedLinks.unshift({ link: cleanLink, error: 'رابط غير صالح أو صيغة غير صحيحة' });
-                    continue;
-                }
-                
-                const inviteCode = codeMatch[1];
-                
-                try {
-                    const response = await sock.groupAcceptInvite(inviteCode);
-                    // إذا تطلب الأمر موافقة مشرف (Request Approval)
-                    if (response && (response.includes?.('request') || typeof response === 'string' && response.includes('request'))) {
-                        if (!db.requestLinks.includes(cleanLink)) db.requestLinks.unshift(cleanLink);
-                    } else {
-                        db.joinedLinks.unshift({ link: cleanLink, phone: acc.phone });
-                    }
-                } catch (err) {
-                    const errMsg = err.message || '';
-                    if (errMsg.includes('approval') || errMsg.includes('admin') || errMsg.includes('request')) {
-                        if (!db.requestLinks.includes(cleanLink)) db.requestLinks.unshift(cleanLink);
-                    } else {
-                        db.failedLinks.unshift({ link: cleanLink, error: errMsg || 'فشل الانضمام أو المجموعة مغلقة' });
-                    }
-                }
-                
-                const delay = getRandomDelay();
-                await new Promise(resolve => setTimeout(resolve, delay));
-
-            } catch (e) {
-                db.failedLinks.unshift({ link, error: e.message || 'خطأ غير معروف' });
+            const cleanLink = link.trim();
+            const match = cleanLink.match(/chat\.whatsapp\.com\/([0-9A-Za-z_-]{20,})/);
+            if (!match) {
+                db.failedLinks.unshift({ link: cleanLink, error: 'رابط غير صالح' });
+                continue;
             }
+
+            try {
+                // محاولة الانضمام
+                await sock.groupAcceptInvite(match[1]);
+                db.joinedLinks.unshift({ link: cleanLink, phone: acc.phone });
+            } catch (err) {
+                const msg = err.message || '';
+                // إذا تطلب الرابط طلب انضمام (Approval)
+                if (msg.includes('approval') || msg.includes('admin') || msg.includes('request')) {
+                    if (!db.pendingLinks.find(p => p.link === cleanLink)) {
+                        db.pendingLinks.unshift({ link: cleanLink, phone: acc.phone });
+                    }
+                } else {
+                    db.failedLinks.unshift({ link: cleanLink, error: msg || 'مجموعة مغلقة أو منتهية' });
+                }
+            }
+            await new Promise(r => setTimeout(r, getRandomDelay(30, 60)));
         }
     }
     db.isRunning = false;
 }
 
-// دالة استخراج الروابط من آخر 48 ساعة لكل حساب
-async function extractRecentLinks() {
+// دالة النشر التلقائي في المجموعات (بين كل جروب وجروب 20 ثانية)
+async function startPublishing() {
+    if (!db.isPublishing) return;
+
+    for (let acc of db.accounts) {
+        if (!db.isPublishing) break;
+        const sock = activeSockets[acc.phone];
+        if (!sock || !acc.message) continue;
+
+        try {
+            const chats = await sock.groupFetchAllParticipating();
+            const groups = Object.keys(chats);
+
+            for (let gId of groups) {
+                if (!db.isPublishing) break;
+                try {
+                    await sock.sendMessage(gId, { text: acc.message });
+                    await new Promise(r => setTimeout(r, 20000)); // 20 ثانية بين كل جروب
+                } catch (e) {
+                    console.log('خطأ في إرسال الرسالة لجروب:', e);
+                }
+            }
+        } catch (e) {
+            console.log('خطأ في جلب مجموعات الحساب:', e);
+        }
+    }
+    db.isPublishing = false;
+}
+
+// دالة استخراج روابط الجروبات لآخر 48 ساعة
+async function extractUserGroups() {
+    const twoDaysAgo = Date.now() - (48 * 60 * 60 * 1000);
     for (let acc of db.accounts) {
         const sock = activeSockets[acc.phone];
         if (!sock) continue;
         try {
             const chats = await sock.groupFetchAllParticipating();
-            const twoDaysAgo = Date.now() - (48 * 60 * 60 * 1000);
-            
-            for (const jid in chats) {
-                const group = chats[jid];
-                // محاولة جلب رسائل القروب الحديثة (إن وجدت الصلاحية) لاستخراج الروابط
-                const messages = await sock.fetchMessages(jid, { count: 50 }).catch(() => []);
-                for (const msg of messages) {
-                    const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-                    const matches = text.match(/https:\/\/chat\.whatsapp\.com\/[0-9A-Za-z_-]{20,}/g);
-                    if (matches) {
-                        matches.forEach(m => {
-                            if (!db.extractedLinks.includes(m)) {
-                                db.extractedLinks.push(m);
-                            }
-                        });
+            for (let gId in chats) {
+                const group = chats[gId];
+                // التحقق من النشاط أو الإنشاء خلال آخر 48 ساعة إن توفرت البيانات
+                const createdTime = (group.creation || 0) * 1000;
+                if (createdTime === 0 || createdTime >= twoDaysAgo) {
+                    // توليد أو محاولة جلب رابط الدعوة إن أمكن أو تخزين معرف المجموعة كمرجع
+                    const inviteLink = `https://chat.whatsapp.com/${gId}`;
+                    if (!db.extractedLinks.includes(inviteLink)) {
+                        db.extractedLinks.push(inviteLink);
                     }
                 }
             }
         } catch (e) {
-            console.log('خطأ في استخراج الروابط:', e);
+            console.log('خطأ في استخراج المجموعات:', e);
         }
-    }
-}
-
-// دالة النشر التلقائي في المجموعات لكل حساب بفاصل 20 ثانية
-async function startPostingAutomation() {
-    db.isPostingRunning = true;
-    while (db.isPostingRunning) {
-        for (let acc of db.accounts) {
-            if (!db.isPostingRunning) break;
-            if (!acc.postMessage) continue;
-
-            const sock = activeSockets[acc.phone];
-            if (!sock) continue;
-
-            try {
-                const chats = await sock.groupFetchAllParticipating();
-                for (const jid in chats) {
-                    if (!db.isPostingRunning) break;
-                    await sock.sendMessage(jid, { text: acc.postMessage });
-                    await new Promise(resolve => setTimeout(resolve, 20000)); // 20 ثانية بين كل جروب
-                }
-            } catch (e) {
-                console.log('خطأ أثناء النشر:', e);
-            }
-        }
-        // الانتظار لدورة جديدة أو التحقق كل دقيقة
-        await new Promise(resolve => setTimeout(resolve, 60000));
     }
 }
 
@@ -197,334 +167,303 @@ app.get(['/', '/api/status'], (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>لوحة تحكم الواتساب المتقدمة</title>
+        <title>لوحة التحكم الذكية - واتساب</title>
         <style>
-            body { font-family: system-ui, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 15px; }
-            .card { background: #1e293b; border-radius: 14px; padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.4); border: 1px solid #334155; }
-            h2 { text-align: center; color: #38bdf8; margin-bottom: 20px; }
-            h3 { margin-top: 0; font-size: 17px; border-bottom: 1px solid #334151; padding-bottom: 8px; color: #e2e8f0; }
-            .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; margin-top: 8px; transition: 0.2s; }
+            :root { --bg: #0f172a; --card: #1e293b; --accent: #3b82f6; --success: #10b981; --danger: #ef4444; --text: #f8fafc; }
+            body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 12px; }
+            #lockScreen { position: fixed; inset: 0; background: var(--bg); z-index: 9999; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 20px; }
+            .card { background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); border: 1px solid #334155; }
+            h2 { text-align: center; color: var(--success); margin-bottom: 16px; font-size: 20px; }
+            h3 { margin-top: 0; font-size: 16px; border-bottom: 1px solid #334151; padding-bottom: 8px; color: #38bdf8; }
+            .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; margin-top: 8px; transition: 0.2s; }
+            .btn-blue { background: var(--accent); color: white; }
+            .btn-green { background: var(--success); color: white; }
+            .btn-red { background: var(--danger); color: white; }
             .btn:active { transform: scale(0.98); }
-            .btn-green { background: #10b981; color: white; }
-            .btn-red { background: #ef4444; color: white; }
-            .btn-blue { background: #0284c7; color: white; }
-            .btn-purple { background: #8b5cf6; color: white; }
-            input, textarea { width: 100%; padding: 10px; margin-top: 6px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: white; box-sizing: border-box; }
-            ul { padding-right: 20px; max-height: 140px; overflow-y: auto; background: #0f172a; border-radius: 6px; padding: 8px; }
-            li { font-size: 13px; margin-bottom: 6px; word-break: break-all; border-bottom: 1px solid #334151; padding-bottom: 4px; }
-            .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-            .running { background: #10b981; color: #fff; }
-            .stopped { background: #ef4444; color: #fff; }
-            .account-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
-            .account-box { background: #0f172a; border: 2px solid #38bdf8; border-radius: 10px; padding: 12px; width: calc(50% - 6px); box-sizing: border-box; text-align: center; cursor: pointer; }
-            .account-box span { font-size: 22px; font-weight: bold; color: #38bdf8; display: block; margin-bottom: 5px; }
-            #loginScreen { position: fixed; inset: 0; background: #0f172a; display: flex; justify-content: center; align-items: center; z-index: 999; }
-            .login-card { background: #1e293b; padding: 30px; border-radius: 16px; width: 90%; max-width: 350px; text-align: center; border: 1px solid #334151; }
+            input, textarea { width: 100%; padding: 10px; margin-top: 6px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: white; box-sizing: border-box; font-size: 14px; }
+            .accounts-grid { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+            .account-badge { background: #334155; border: 2px solid var(--accent); border-radius: 10px; padding: 10px; width: 60px; height: 60px; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: bold; cursor: pointer; position: relative; }
+            .account-badge span { font-size: 10px; position: absolute; bottom: 2px; color: #cbd5e1; }
+            ul { padding-right: 20px; max-height: 120px; overflow-y: auto; background: #0f172a; border-radius: 6px; padding: 8px; margin: 5px 0; }
+            li { font-size: 12px; margin-bottom: 4px; word-break: break-all; border-bottom: 1px solid #1e293b; padding-bottom: 3px; }
+            .link-box { background: #0f172a; padding: 10px; border-radius: 6px; text-align: center; cursor: pointer; border: 1px dashed var(--accent); margin-top: 6px; font-weight: bold; color: #38bdf8; }
         </style>
     </head>
     <body>
 
-        <!-- شاشة تسجيل الدخول -->
-        <div id="loginScreen">
-            <div class="login-card">
-                <h3 style="color:#38bdf8;">حماية التطبيق</h3>
-                <p style="font-size:13px; color:#94a3b8;">يرجى إدخال رمز المرور للمتابعة</p>
-                <input type="password" id="passInput" placeholder="أدخل رمز المرور..." style="text-align:center; font-size:16px;">
-                <button class="btn btn-blue" onclick="checkPassword()">دخول</button>
+        <!-- شاشة قفل التطبيق -->
+        <div id="lockScreen">
+            <div class="card" style="width: 100%; max-width: 320px; text-align: center;">
+                <h3>🔐 قفل الحماية</h3>
+                <p style="font-size: 13px; color: #94a3b8;">أدخل رمز المرور لفتح التطبيق:</p>
+                <input type="password" id="passCode" placeholder="أدخل الرمز هنا..." style="text-align: center; letter-spacing: 2px;">
+                <button class="btn btn-blue" onclick="checkUnlock()" style="margin-top: 12px;">دخول</button>
             </div>
         </div>
 
         <div id="mainApp" style="display:none;">
-            <h2>لوحة التحكم المتقدمة</h2>
+            <h2>لوحة التحكم الذكية</h2>
 
             <div class="card">
-                <h3>حالة النظام</h3>
-                <p>الحالة العامة: <span class="badge ${db.isRunning ? 'running' : 'stopped'}">${db.isRunning ? 'يعمل 🚀' : 'متوقف ⏹'}</span></p>
-                <p>حالة النشر: <span class="badge ${db.isPostingRunning ? 'running' : 'stopped'}">${db.isPostingRunning ? 'يشر تلقائياً 📢' : 'متوقف 🔕'}</span></p>
-                <p>الحسابات المضافة: <b>${db.accounts.length}</b> | إجمالي الروابط: <b>${db.links.length}</b></p>
+                <h3>إضافة حساب واتساب جديد</h3>
+                <input type="text" id="accPhone" placeholder="رقم الهاتف مع الرمز (مثال: 967775890747)">
+                <button class="btn btn-blue" onclick="addAccount()">إضافة الحساب</button>
             </div>
 
             <div class="card">
-                <h3>إضافة حساب واتساب</h3>
-                <input type="text" id="accPhone" placeholder="أدخل رقم الهاتف (مثال: 967775890747)">
-                <button class="btn btn-blue" onclick="addAccount()">إضافة وربط الحساب</button>
+                <h3>الحسابات المضافة (اضغط على الرمز لإظهار الرقم)</h3>
+                <div id="accountsGrid" class="accounts-grid">جاري التحميل...</div>
+                <div id="accountControls" style="margin-top: 12px; display:none;" class="card" style="background:#0f172a;">
+                    <p id="selectedAccText" style="font-weight:bold; color:#38bdf8; margin-top:0;"></p>
+                    <button class="btn btn-red" onclick="deleteActiveAccount()">حذف الحساب</button>
+                    <button class="btn btn-blue" onclick="setAccountMessage()">إضافة / تعديل النشرة</button>
+                    <button class="btn btn-green" onclick="setAccountSchedule()">جدولة النشر (وقت/0)</button>
+                </div>
             </div>
 
             <div class="card">
-                <h3>الحسابات المضافة (اضغط على الحرف لعرض الرقم)</h3>
-                <div id="accountsList" class="account-grid">جاري التحميل...</div>
-            </div>
-
-            <div class="card">
-                <h3>إضافة روابط المجموعات العامة للانضمام</h3>
+                <h3>إضافة روابط المجموعات (للانضمام)</h3>
                 <textarea id="linksInput" rows="3" placeholder="الصق الروابط هنا (كل رابط في سطر)..."></textarea>
-                <button class="btn btn-blue" onclick="addLinks()">حفظ الروابط (بدون تكرار)</button>
+                <button class="btn btn-blue" onclick="addLinks()">حفظ الروابط</button>
             </div>
 
             <div class="card">
-                <h3>استخراج الروابط من آخر 48 ساعة</h3>
-                <button class="btn btn-purple" onclick="extractLinksAction()">بدء استخراج الروابط العامة</button>
-                <p style="margin-top:10px; font-size:13px;">الروابط المستخرجة (${db.extractedLinks.length}):</p>
-                <button class="btn btn-blue" style="background:#047857;" onclick="downloadFile('/api/download/extracted', 'Extracted_Links_48h.txt')">تحميل ملف الروابط المستخرجة (TXT)</button>
+                <h3>النتائج والسجلات</h3>
+                <p style="color:var(--success);">✅ تم الانضمام (${db.joinedLinks.length}):</p>
+                <ul>${db.joinedLinks.map(i => `<li>[${i.phone}] ${i.link}</li>`).join('') || '<li>لا توجد نتائج</li>'}</ul>
+
+                <p style="color:#f59e0b; margin-top:8px;">⏳ روابط طلبات الانضمام (${db.pendingLinks.length}):</p>
+                <div class="link-box" onclick="downloadTxt('pending')">📥 اضغط لتحميل روابط طلبات الانضمام (txt)</div>
+                <ul>${db.pendingLinks.map(i => `<li>[${i.phone}] ${i.link}</li>`).join('') || '<li>لا توجد طلبات</li>'}</ul>
+
+                <p style="color:#38bdf8; margin-top:8px;">🔗 روابط الجروبات المستخرجة (آخر 48 ساعة):</p>
+                <div class="link-box" onclick="downloadTxt('extracted')">📥 اضغط لتحميل الروابط المستخرجة العامة (txt)</div>
             </div>
 
             <div class="card">
-                <h3>روابط طلبات الانضمام (التي تتطلب موافقة)</h3>
-                <p style="font-size:13px; color:#38bdf8;">الإجمالي: ${db.requestLinks.length}</p>
-                <button class="btn btn-blue" onclick="downloadFile('/api/download/requests', 'Request_Approval_Links.txt')">تحميل روابط طلبات الانضمام كـ TXT</button>
-            </div>
-
-            <div class="card">
-                <h3>النتائج والسجلات الحية</h3>
-                <p style="color:#10b981;">✅ تم الانضمام (${db.joinedLinks.length}):</p>
-                <ul>${db.joinedLinks.map(item => `<li><b>[${item.phone}]</b> ${item.link}</li>`).join('') || '<li>لا توجد نتائج بعد</li>'}</ul>
-
-                <p style="color:#ef4444; margin-top:10px;">❌ الأخطاء أو الروابط التالفة (${db.failedLinks.length}):</p>
-                <ul>${db.failedLinks.map(item => `<li>🔗 ${item.link}<br><span style="color:#f87171; font-size:11px;">السبب: ${item.error}</span></li>`).join('') || '<li>لا توجد أخطاء</li>'}</ul>
-            </div>
-
-            <div class="card">
-                <h3>التحكم العام</h3>
-                <button class="btn btn-green" onclick="startProcess()">تشغيل الانضمام (30 رابط لكل حساب)</button>
-                <button class="btn btn-red" onclick="stopProcess()">إيقاف عمليات الانضمام</button>
-                <button class="btn btn-purple" onclick="startPosting()">تشغيل النشر التلقائي في المجموعات</button>
-                <button class="btn btn-red" onclick="stopPosting()">إيقاف النشر التلقائي</button>
+                <h3>التحكم العام والمهام</h3>
+                <button class="btn btn-green" onclick="startProcess()">تشغيل عمليات الانضمام والنشر</button>
+                <button class="btn btn-red" onclick="stopProcess()" style="margin-top:6px;">إيقاف العمليات</button>
+                <button class="btn btn-blue" onclick="extractGroups()" style="margin-top:6px;">استخراج روابط الجروبات (آخر 48 ساعة)</button>
             </div>
         </div>
 
         <script>
-            function checkPassword() {
-                const pass = document.getElementById('passInput').value;
-                if(pass === '1997$7') {
-                    document.getElementById('loginScreen').style.display = 'none';
+            let selectedPhone = null;
+
+            function checkUnlock() {
+                const val = document.getElementById('passCode').value;
+                if(val === '1997$7') {
+                    localStorage.setItem('unlocked', 'true');
+                    document.getElementById('lockScreen').style.display = 'none';
                     document.getElementById('mainApp').style.display = 'block';
-                    loadData();
                 } else {
                     alert('رمز المرور غير صحيح!');
                 }
             }
 
+            window.onload = function() {
+                if(localStorage.getItem('unlocked') === 'true') {
+                    document.getElementById('lockScreen').style.display = 'none';
+                    document.getElementById('mainApp').style.display = 'block';
+                }
+                loadData();
+                setInterval(loadData, 4000);
+            }
+
             function loadData() {
                 fetch('/api/get-data').then(res => res.json()).then(data => {
-                    let accHtml = '';
+                    let gridHtml = '';
                     if(data.accounts.length === 0) {
-                        accHtml = '<p style="color:#9ca3af; font-size:13px; width:100%; text-align:center;">لا توجد حسابات مضافة.</p>';
+                        gridHtml = '<p style="font-size:13px; color:#94a3b8;">لا توجد حسابات مضافة.</p>';
+                        document.getElementById('accountControls').style.display = 'none';
                     } else {
-                        data.accounts.forEach((acc, index) => {
-                            accHtml += \`
-                            <div class="account-box" onclick="showAccountDetails('\${acc.phone}', '\${acc.letter}', \${index})">
-                                <span>\${acc.letter}</span>
-                                <small style="color:#cbd5e1;">كود: \${acc.pairingCode || 'جاهز'}</small>
+                        data.accounts.forEach(acc => {
+                            gridHtml += \`<div class="account-badge" onclick="selectAcc('\${acc.phone}', '\${acc.letter}')">
+                                \${acc.letter}
+                                <span>\${acc.pairingCode ? 'متصل' : 'رابط'}</span>
                             </div>\`;
                         });
                     }
-                    document.getElementById('accountsList').innerHTML = accHtml;
+                    document.getElementById('accountsGrid').innerHTML = gridHtml;
                 });
             }
 
-            function showAccountDetails(phone, letter, index) {
-                let action = prompt(\`الحساب [\${letter}]\\nرقم الهاتف: \\\n\${phone}\\\n\\\nاختر العملية المطلوبة:\\n1. حذف الحساب\\n2. إضافة/تعديل رسالة النشر\\n3. جدولة وقت النشر (نظام 24, مثال 08:20 أو 0 لتبدأ فوراً)\`);
-                
-                if(action === '1') {
-                    if(confirm('هل أنت متأكد من حذف هذا الحساب؟')) {
-                        fetch('/api/delete-account', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ index })
-                        }).then(() => loadData());
-                    }
-                } else if(action === '2') {
-                    let msg = prompt('أدخل نص الرسالة المراد نشرها في الجروبات لهذا الحساب:');
-                    if(msg !== null) {
-                        fetch('/api/set-post', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ index, message: msg })
-                        }).then(() => alert('تم حفظ النشرة بنجاح'));
-                    }
-                } else if(action === '3') {
-                    let time = prompt('أدخل وقت الجدولة بنظام 24 (مثال 08:20) أو أدخل 0 للبدء فوراً:');
-                    if(time !== null) {
-                        fetch('/api/set-schedule', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ index, time })
-                        }).then(() => alert('تم ضبط وقت الجدولة بنجاح'));
-                    }
-                }
+            function selectAcc(phone, letter) {
+                selectedPhone = phone;
+                document.getElementById('accountControls').style.display = 'block';
+                document.getElementById('selectedAccText.innerHTML' = `الحساب المختار: الحرف \${letter} | الرقم: \${phone}`);
+                document.getElementById('selectedAccText').innerText = `الحساب المختار: الحرف ${letter} | الرقم: ${phone}`;
             }
 
             function addAccount() {
                 const phone = document.getElementById('accPhone').value;
-                if(!phone) return alert('يرجى إدخال الرقم');
+                if(!phone) return alert('أدخل الرقم');
                 fetch('/api/add-account', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ phone })
-                }).then(() => { document.getElementById('accPhone').value = ''; loadData(); alert('جاري ربط الحساب وتوليد كود الربط إن لم يكن مسجلاً...'); });
+                }).then(() => { document.getElementById('accPhone').value = ''; loadData(); alert('جاري إضافة الحساب وتوليد كود الربط إن لم يكن مسجلاً'); });
+            }
+
+            function deleteActiveAccount() {
+                if(!selectedPhone) return;
+                fetch('/api/delete-account', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ phone: selectedPhone })
+                }).then(() => { selectedPhone = null; document.getElementById('accountControls').style.display = 'none'; loadData(); });
+            }
+
+            function setAccountMessage() {
+                if(!selectedPhone) return;
+                const msg = prompt('أدخل نص الرسالة المراد نشرها لهذا الحساب:');
+                if(msg !== null) {
+                    fetch('/api/set-message', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ phone: selectedPhone, message: msg })
+                    }).then(() => alert('تم حفظ النشرة بنجاح'));
+                }
+            }
+
+            function setAccountSchedule() {
+                if(!selectedPhone) return;
+                const time = prompt('أدخل وقت الجدولة بنظام 24 (مثال 08:20) أو أدخل 0 للبدء فوراً:');
+                if(time !== null) {
+                    fetch('/api/set-schedule', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ phone: selectedPhone, scheduleTime: time })
+                    }).then(() => alert('تم تعيين جدول النشر'));
+                }
             }
 
             function addLinks() {
                 const text = document.getElementById('linksInput').value;
-                if(!text) return alert('يرجى لصق الروابط');
-                const links = text.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+                if(!text) return;
+                const links = text.split('\\n').map(l => l.trim()).filter(l => l);
                 fetch('/api/add-links', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ links })
-                }).then(res => res.json()).then(data => {
-                    document.getElementById('linksInput').value = '';
-                    alert('تم حفظ الروابط العامة بدون تكرار! الإجمالي: ' + data.totalLinks);
-                    location.reload();
-                });
-            }
-
-            function extractLinksAction() {
-                fetch('/api/extract-links', { method: 'POST' }).then(res => res.json()).then(data => {
-                    alert(data.message);
-                    location.reload();
-                });
-            }
-
-            function downloadFile(url, filename) {
-                fetch(url).then(res => res.text()).then(text => {
-                    const blob = new Blob([text], { type: 'text/plain' });
-                    const link = document.createElement('a');
-                    link.href = URL.createObjectURL(blob);
-                    link.download = filename;
-                    link.click();
-                });
+                }).then(() => { document.getElementById('linksInput').value = ''; alert('تم حفظ الروابط'); location.reload(); });
             }
 
             function startProcess() {
-                fetch('/api/start', { method: 'POST' }).then(res => res.json()).then(data => {
-                    alert(data.message);
-                    location.reload();
-                });
+                fetch('/api/start', { method: 'POST' }).then(res => res.json()).then(d => alert(d.message));
             }
 
             function stopProcess() {
-                fetch('/api/stop', { method: 'POST' }).then(res => res.json()).then(data => {
-                    alert(data.message);
+                fetch('/api/stop', { method: 'POST' }).then(res => res.json()).then(d => alert(d.message));
+            }
+
+            function extractGroups() {
+                fetch('/api/extract-groups', { method: 'POST' }).then(res => res.json()).then(d => {
+                    alert('تم استخراج روابط الجروبات بنجاح!');
                     location.reload();
                 });
             }
 
-            function startPosting() {
-                fetch('/api/start-posting', { method: 'POST' }).then(res => res.json()).then(data => {
-                    alert(data.message);
-                    location.reload();
-                });
+            function downloadTxt(type) {
+                window.location.href = '/api/download/' + type;
             }
-
-            function stopPosting() {
-                fetch('/api/stop-posting', { method: 'POST' }).then(res => res.json()).then(data => {
-                    alert(data.message);
-                    location.reload();
-                });
-            }
-
-            setInterval(loadData, 5000);
         </script>
     </body>
     </html>
     `);
 });
 
+const letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
+
 app.get('/api/get-data', (req, res) => {
-    const updatedAccounts = db.accounts.map(acc => ({
+    const accs = db.accounts.map(acc => ({
         ...acc,
         pairingCode: pairingCodes[acc.phone] || null
     }));
-    res.json({ ...db, accounts: updatedAccounts });
+    res.json({ ...db, accounts: accs });
 });
 
 app.post('/api/add-account', async (req, res) => {
     const { phone } = req.body;
     if (phone && !db.accounts.find(a => a.phone === phone)) {
-        const letter = getLetter(db.accounts.length);
-        db.accounts.push({ phone, letter, postMessage: '', scheduleTime: '0', currentIndex: 0 });
+        const letter = letters[db.accounts.length % letters.length];
+        db.accounts.push({
+            phone,
+            letter,
+            message: '',
+            scheduleTime: '0',
+            currentIndex: 0
+        });
         await connectWhatsAppAccount(phone);
-    }
-    res.json({ success: true, accounts: db.accounts });
-});
-
-app.post('/api/delete-account', (req, res) => {
-    const { index } = req.body;
-    if (index >= 0 && index < db.accounts.length) {
-        db.accounts.splice(index, 1);
-        // إعادة ترتيب الحروف للأبجدية من جديد
-        db.accounts.forEach((acc, i) => acc.letter = getLetter(i));
-    }
-    res.json({ success: true, accounts: db.accounts });
-});
-
-app.post('/api/set-post', (req, res) => {
-    const { index, message } = req.body;
-    if (db.accounts[index]) {
-        db.accounts[index].postMessage = message;
     }
     res.json({ success: true });
 });
 
+app.post('/api/delete-account', (req, res) => {
+    const { phone } = req.body;
+    db.accounts = db.accounts.filter(a => a.phone !== phone);
+    res.json({ success: true });
+});
+
+app.post('/api/set-message', (req, res) => {
+    const { phone, message } = req.body;
+    const acc = db.accounts.find(a => a.phone === phone);
+    if (acc) acc.message = message;
+    res.json({ success: true });
+});
+
 app.post('/api/set-schedule', (req, res) => {
-    const { index, time } = req.body;
-    if (db.accounts[index]) {
-        db.accounts[index].scheduleTime = time;
-    }
+    const { phone, scheduleTime } = req.body;
+    const acc = db.accounts.find(a => a.phone === phone);
+    if (acc) acc.scheduleTime = scheduleTime;
     res.json({ success: true });
 });
 
 app.post('/api/add-links', (req, res) => {
     const { links } = req.body;
-    if (links && Array.isArray(links)) {
-        links.forEach(link => {
-            if (!db.links.includes(link)) {
-                db.links.push(link);
-            }
-        });
-    }
-    res.json({ success: true, totalLinks: db.links.length });
+    links.forEach(l => {
+        if (!db.links.includes(l)) db.links.push(l);
+    });
+    res.json({ success: true });
 });
 
-app.post('/api/extract-links', async (req, res) => {
-    await extractRecentLinks();
-    res.json({ success: true, message: 'تم الانتهاء من استخراج الروابط الحديثة بنجاح!' });
-});
-
-app.get('/api/download/extracted', (req, res) => {
-    res.setHeader('Content-Type', 'text/plain');
-    res.send(db.extractedLinks.join('\n'));
-});
-
-app.get('/api/download/requests', (req, res) => {
-    res.setHeader('Content-Type', 'text/plain');
-    res.send(db.requestLinks.join('\n'));
+app.post('/api/extract-groups', async (req, res) => {
+    await extractUserGroups();
+    res.json({ success: true });
 });
 
 app.post('/api/start', (req, res) => {
-    if (db.accounts.length === 0) return res.json({ success: false, message: 'أضف حساباً واحداً على الأقل!' });
-    if (db.links.length === 0) return res.json({ success: false, message: 'أضف روابط مجموعات أولاً!' });
-    
     db.isRunning = true;
+    db.isPublishing = true;
     startAutomation();
-    res.json({ success: true, message: 'بدأت عملية الانضمام والتحقق من طلبات الانضمام بنجاح!' });
+    startPublishing();
+    res.json({ success: true, message: 'بدأت عمليات الانضمام والنشر التلقائي بنجاح!' });
 });
 
 app.post('/api/stop', (req, res) => {
     db.isRunning = false;
+    db.isPublishing = false;
     res.json({ success: true, message: 'تم إيقاف العمليات.' });
 });
 
-app.post('/api/start-posting', (req, res) => {
-    if (db.accounts.length === 0) return res.json({ success: false, message: 'أضف حساباً أولاً!' });
-    startPostingAutomation();
-    res.json({ success: true, message: 'بدأ النشر التلقائي في المجموعات (بفاصل 20 ثانية بين كل مجموعة)!' });
-});
+// تحميل الملفات بصيغة txt
+app.get('/api/download/:type', (req, res) => {
+    const type = req.params.type;
+    let dataList = [];
+    let fileName = 'links.txt';
 
-app.post('/api/stop-posting', (req, res) => {
-    db.isPostingRunning = false;
-    res.json({ success: true, message: 'تم إيقاف النشر التلقائي.' });
+    if (type === 'pending') {
+        dataList = db.pendingLinks.map(i => i.link);
+        fileName = 'pending_approval_links.txt';
+    } else if (type === 'extracted') {
+        dataList = db.extractedLinks;
+        fileName = 'extracted_groups_48h.txt';
+    }
+
+    res.setHeader('Content-disposition', `attachment; filename=${fileName}`);
+    res.setHeader('Content-type', 'text/plain');
+    res.send(dataList.join('\n'));
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

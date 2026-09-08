@@ -1,1 +1,1 @@
-# wa-bot
+# index.js

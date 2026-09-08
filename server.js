@@ -1,9 +1,8 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
 
-// ------------------- الإعدادات الرئيسية -------------------
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
 const ADMIN_ID = 7640301049;
 
@@ -13,7 +12,6 @@ if (!fs.existsSync('./sessions')) {
     fs.mkdirSync('./sessions', { recursive: true });
 }
 
-// قاعدة البيانات
 const DB_FILE = './database.json';
 let db = { approvedUsers: [ADMIN_ID], pendingUsers: [], userAccounts: {} };
 
@@ -26,12 +24,21 @@ function saveDB() {
 }
 
 const waSessions = {};
-const userStates = {}; // تتبع حالة المستخدم للحجم والإلغاء
+const userStates = {};
 
-// ------------------- ربط الواتساب وإظهار النتائج والمشاكل -------------------
+const cancelKeyboard = {
+    reply_markup: {
+        inline_keyboard: [[{ text: "❌ إلغاء العمليّة", callback_data: "cancel_action" }]]
+    }
+};
+
 async function startWASessionWithCode(chatId, phoneNumber, accountName) {
     const sessionKey = `${chatId}_${accountName}`;
     const sessionDir = path.join(__dirname, 'sessions', sessionKey);
+
+    if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
 
     try {
         const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -41,7 +48,9 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
             version,
             auth: state,
             printQRInTerminal: false,
-            browser: ["Ubuntu", "Chrome", "20.0.04"]
+            // استخدام بصمة macOS الرسمية لتخطي حظر السيرفرات عند طلب الكود
+            browser: Browsers.macOS("Desktop"),
+            syncFullHistory: false
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -59,7 +68,7 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
                 if (statusCode !== DisconnectReason.loggedOut) {
                     startWASessionWithCode(chatId, phoneNumber, accountName);
                 } else {
-                    bot.sendMessage(chatId, `⚠️ **نتيجة الخدمة:** تم تسجيل الخروج أو إلغاء الاتصال بالحساب [${accountName}].`);
+                    bot.sendMessage(chatId, `⚠️ **نتيجة:** تم تسجيل الخروج أو إلغاء ربط الحساب [${accountName}].`);
                 }
             }
         });
@@ -69,32 +78,25 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
                 try {
                     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
                     const pairingCode = await sock.requestPairingCode(cleanPhone);
-                    const formattedCode = pairingCode?.match(/.{1,4}/g)?.join('-') || pairingCode;
 
                     bot.sendMessage(
                         chatId,
-                        `📱 **كود ربط الحساب المخصص لك:**\n\n\`${formattedCode}\`\n\n*(اضغط على الكود أعلاه لنسخه فوراً)*\n\n**الخطوات:**\n1. افتح الواتساب > **الأجهزة المرتبطة** > **ربط جهاز**.\n2. اختر **الربط برقم الهاتف** ثم أدخل الكود أعلاه.`,
-                        {
-                            parse_mode: 'Markdown',
-                            reply_markup: {
-                                inline_keyboard: [[{ text: "❌ إلغاء العمليّة", callback_data: "cancel_action" }]]
-                            }
-                        }
+                        `📱 **كود الربط المخصص لك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود أعلاه لنسخه مباشرة دون الفواصل)*\n\n⚠️ **تنبيه:** أدخل الكود في الواتساب فوراً.`,
+                        { parse_mode: 'Markdown', ...cancelKeyboard }
                     );
                 } catch (err) {
-                    console.error("خطأ الربط:", err);
                     bot.sendMessage(
                         chatId, 
-                        `❌ **تعذر إكمال الطلب (مشكلة بالبوت):**\n\`${err.message || err}\`\n\nيرجى التأكد من كتابة الرقم مع رمز الدولة وإعادة المحاولة.`,
+                        `❌ **تعذر إصدار الكود:**\n\`${err.message || err}\`\n\nيرجى التأكد من كتابة الرقم صحيحة بالرمز الدولي.`,
                         { parse_mode: 'Markdown', reply_markup: getMainKeyboard(chatId) }
                     );
                 }
-            }, 5000);
+            }, 2000);
         }
 
         waSessions[sessionKey] = sock;
     } catch (e) {
-        bot.sendMessage(chatId, `⚠️ **خطأ في النظام:**\n\`${e.message}\``, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `⚠️ **خطأ بالنظام:**\n\`${e.message}\``, { parse_mode: 'Markdown' });
     }
 }
 
@@ -125,7 +127,6 @@ function getMainKeyboard(chatId) {
     return { inline_keyboard };
 }
 
-// ------------------- الأوامر والرسائل -------------------
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     delete userStates[chatId];
@@ -134,27 +135,11 @@ bot.onText(/\/start/, (msg) => {
         if (!db.pendingUsers.includes(chatId)) {
             db.pendingUsers.push(chatId);
             saveDB();
-
-            bot.sendMessage(
-                ADMIN_ID, 
-                `🔔 **طلب جديد لاستخدام البوت!**\n\nالمستخدم: ${msg.from.first_name || ''} (@${msg.from.username || 'بدون_معرف'})\nالمعرف: \`${chatId}\``, 
-                {
-                    parse_mode: 'Markdown',
-                    reply_markup: {
-                        inline_keyboard: [
-                            [
-                                { text: "✅ موافقة", callback_data: `approve_${chatId}` },
-                                { text: "❌ رفض", callback_data: `reject_${chatId}` }
-                            ]
-                        ]
-                    }
-                }
-            );
         }
-        return bot.sendMessage(chatId, "⏳ **طلبك قيد المراجعة.**\nيرجى الانتظار حتى يتم قبول حسابك من قبل المالك.");
+        return bot.sendMessage(chatId, "⏳ **طلبك قيد المراجعة.**");
     }
 
-    bot.sendMessage(chatId, `🤖 **أهلاً بك في لوحة التحكم الخاصة بك!**\nجميع عملياتك وحساباتك مستقلة تماماً.`, {
+    bot.sendMessage(chatId, `🤖 **أهلاً بك في لوحة التحكم!**`, {
         parse_mode: 'Markdown',
         reply_markup: getMainKeyboard(chatId)
     });
@@ -176,61 +161,27 @@ bot.on('message', async (msg) => {
 
         bot.sendMessage(
             chatId, 
-            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...\nيرجى الانتظار بضعة ثوانٍ.`, 
-            {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [[{ text: "❌ إلغاء العمليّة", callback_data: "cancel_action" }]]
-                }
-            }
+            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...`, 
+            { parse_mode: 'Markdown', ...cancelKeyboard }
         );
         startWASessionWithCode(chatId, text, accId);
     }
 });
 
-// ------------------- الأزرار الشفافة والإلغاء -------------------
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
 
-    // زر إلغاء العملية
     if (data === "cancel_action") {
         delete userStates[chatId];
-        bot.answerCallbackQuery(query.id, { text: "تم إلغاء العملية الحالية." });
+        bot.answerCallbackQuery(query.id, { text: "تم إلغاء العملية." });
         return bot.sendMessage(chatId, "🛑 **تم إلغاء العمليّة بنجاح.**", {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
     }
 
-    if (data.startsWith('approve_') && chatId === ADMIN_ID) {
-        const targetId = parseInt(data.split('_')[1]);
-        if (!db.approvedUsers.includes(targetId)) {
-            db.approvedUsers.push(targetId);
-            db.pendingUsers = db.pendingUsers.filter(id => id !== targetId);
-            saveDB();
-
-            bot.answerCallbackQuery(query.id, { text: "تمت الموافقة بنجاح!" });
-            bot.sendMessage(targetId, "🎉 **تمت الموافقة على استخدامك للبوت!**\nاضغط /start للبدء.");
-            bot.editMessageText(`✅ تم قبول المستخدم \`${targetId}\``, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
-        }
-        return;
-    }
-
-    if (data.startsWith('reject_') && chatId === ADMIN_ID) {
-        const targetId = parseInt(data.split('_')[1]);
-        db.pendingUsers = db.pendingUsers.filter(id => id !== targetId);
-        saveDB();
-
-        bot.answerCallbackQuery(query.id, { text: "تم الرفض." });
-        bot.sendMessage(targetId, "❌ للأسف، تم رفض طلبك لاستخدام البوت.");
-        bot.editMessageText(`❌ تم رفض المستخدم \`${targetId}\``, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
-        return;
-    }
-
-    if (!isApproved(chatId)) {
-        return bot.answerCallbackQuery(query.id, { text: "عذراً، الحساب غير معتمد.", show_alert: true });
-    }
+    if (!isApproved(chatId)) return;
 
     if (data === "menu_add_acc") {
         bot.answerCallbackQuery(query.id);
@@ -238,43 +189,60 @@ bot.on('callback_query', async (query) => {
         bot.sendMessage(
             chatId, 
             "📞 **يرجى إرسال رقم الواتساب الخاص بك مع رمز الدولة:**\n\nمثال: `966500000000` أو `96770000000`", 
-            { 
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [[{ text: "❌ إلغاء العمليّة", callback_data: "cancel_action" }]]
-                }
-            }
+            { parse_mode: 'Markdown', ...cancelKeyboard }
         );
     } else if (data === "menu_accounts") {
         bot.answerCallbackQuery(query.id);
         const userAccs = db.userAccounts[chatId] || [];
-        const accListText = userAccs.length > 0 
-            ? userAccs.map((a, i) => `${i + 1}. \`${a}\``).join('\n') 
-            : 'لا توجد حسابات مرتبطة حالياً.';
         
-        bot.sendMessage(chatId, `📱 **حسابات الواتساب الخاصة بك:**\n\n${accListText}`, {
+        if (userAccs.length === 0) {
+            return bot.sendMessage(chatId, "📱 **حسابات الواتساب:**\n\nلا توجد حسابات مرتبطة حالياً.", {
+                parse_mode: 'Markdown',
+                reply_markup: getMainKeyboard(chatId)
+            });
+        }
+
+        const buttons = userAccs.map(acc => [
+            { text: `📱 ${acc}`, callback_data: `info_${acc}` },
+            { text: `🗑️ حذف ${acc}`, callback_data: `delete_${acc}` }
+        ]);
+        buttons.push([{ text: "❌ إلغاء العمليّة", callback_data: "cancel_action" }]);
+
+        bot.sendMessage(chatId, "📱 **حسابات الواتساب الخاصة بك:**\nاختر حساً للتحكم به أو حذفه:", {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: buttons }
+        });
+    } else if (data.startsWith("delete_")) {
+        const accToDelete = data.replace("delete_", "");
+        bot.answerCallbackQuery(query.id, { text: `جاري حذف الحساب ${accToDelete}...` });
+
+        // حذف الحساب من قاعدة البيانات
+        if (db.userAccounts[chatId]) {
+            db.userAccounts[chatId] = db.userAccounts[chatId].filter(acc => acc !== accToDelete);
+            saveDB();
+        }
+
+        // إغلاق الجلسة ومسح المجلد
+        const sessionKey = `${chatId}_${accToDelete}`;
+        if (waSessions[sessionKey]) {
+            try { waSessions[sessionKey].end(); } catch (e) {}
+            delete waSessions[sessionKey];
+        }
+
+        const sessionDir = path.join(__dirname, 'sessions', sessionKey);
+        if (fs.existsSync(sessionDir)) {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+
+        bot.sendMessage(chatId, `🗑️ **تم حذف الحساب [${accToDelete}] ومسح كل بياناته بنجاح.**`, {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
     } else if (data === "menu_status") {
         bot.answerCallbackQuery(query.id);
-        bot.sendMessage(chatId, "⚙️ **حالة النظام والخدمة:**\n• السيرفر: تعمل بنجاح واستقرار.\n• جلساتك النشطة: متاحة.", {
+        bot.sendMessage(chatId, "⚙️ **حالة الخدمة:** تعمل واستجابة السيرفر متصلة.", {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
-    } else if (data === "admin_users" && chatId === ADMIN_ID) {
-        bot.answerCallbackQuery(query.id);
-        const approvedList = db.approvedUsers.map(id => `• \`${id}\``).join('\n');
-        const pendingList = db.pendingUsers.length > 0 
-            ? db.pendingUsers.map(id => `• \`${id}\``).join('\n') 
-            : 'لا يوجد طلبات قائمة.';
-
-        bot.sendMessage(
-            chatId, 
-            `👑 **إدارة المستخدمين:**\n\n**المستخدمون المعتمدون:**\n${approvedList}\n\n**طلبات الانتظار:**\n${pendingList}`, 
-            { parse_mode: 'Markdown', reply_markup: getMainKeyboard(chatId) }
-        );
     }
 });
-
-console.log("🚀 Server is running...");

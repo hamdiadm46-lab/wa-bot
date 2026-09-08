@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAEm7odPf8fk7O119NBczvYGw_tVjl0sO30';
 const ADMIN_ID = 7640301049;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });

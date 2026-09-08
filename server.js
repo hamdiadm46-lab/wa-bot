@@ -8,7 +8,7 @@ app.use(express.json());
 
 let botStatus = {
     connected: false,
-    phoneNumber: "967775890747",
+    phoneNumber: "966547420621",
     pairingCode: null,
     monitoringEnabled: true,
     broadcastsCount: 0

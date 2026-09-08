@@ -6,8 +6,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ⚠️ استبدل القيم التالية ببياناتك الحقيقية
-const TELEGRAM_TOKEN = 'ضع_توكن_البوت_هنا';
-const ADMIN_CHAT_ID = 'ضع_CHAT_ID_هنا';
+const TELEGRAM_TOKEN = '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
+const ADMIN_CHAT_ID = '7640301049';
 const PHONE_NUMBER = '967775890747'; // رقم الواتساب بدون +
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });

@@ -14,7 +14,7 @@ app.use(express.json());
 
 let botStatus = {
     connected: false,
-    phoneNumber: "967730536867", // رقمك مع المفتاح الدولي بدون +
+    phoneNumber: "967775890747", // رقمك مع المفتاح الدولي بدون +
     pairingCode: null,
     monitoringEnabled: true,
     broadcastsCount: 0

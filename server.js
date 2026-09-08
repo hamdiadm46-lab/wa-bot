@@ -1,108 +1,103 @@
-import makeWASocket, {
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion
-} from '@whiskeysockets/baileys';
-import pino from 'pino';
 import express from 'express';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 
-// ==========================================
-// 1. إعدادات خادم الـ API لتطبيق الأندرويد
-// ==========================================
 const app = express();
+const PORT = process.env.PORT || 3000;
+
 app.use(express.json());
 
 let botStatus = {
     connected: false,
-    phoneNumber: "966547420621", // رقمك مع المفتاح الدولي بدون +
+    phoneNumber: "967775890747",
     pairingCode: null,
     monitoringEnabled: true,
     broadcastsCount: 0
 };
 
-app.get('/api/status', (req, res) => {
-    res.json(botStatus);
-});
+// 1. الصفحة الرئيسية (لوحة التحكم التفاعلية للـ APK)
+app.get('/', (req, res) => {
+    res.send(`
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>لوحة تحكم البوت</title>
+        <style>
+            body { font-family: system-ui, sans-serif; background-color: #111827; color: #fff; margin: 0; padding: 20px; }
+            .card { background: #1f2937; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+            .status { display: inline-block; padding: 6px 12px; border-radius: 20px; font-weight: bold; }
+            .online { background: #10b981; color: #fff; }
+            .offline { background: #ef4444; color: #fff; }
+            .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 10px; }
+            .btn-green { background: #10b981; color: white; }
+            .btn-red { background: #ef4444; color: white; }
+            .btn-blue { background: #3b82f6; color: white; }
+            input { width: 100%; padding: 10px; margin-top: 8px; border-radius: 6px; border: 1px solid #374151; background: #374151; color: white; box-sizing: border-box; }
+        </style>
+    </head>
+    <body>
+        <h2>لوحة تحكم بوت الواتساب</h2>
+        
+        <div class="card">
+            <h3>حالة الاتصال</h3>
+            <p>الوضع: <span class="status ${botStatus.connected ? 'online' : 'offline'}">${botStatus.connected ? 'متصل' : 'غير متصل'}</span></p>
+            <p>الرقم الحالي: <b>${botStatus.phoneNumber}</b></p>
+            ${botStatus.pairingCode ? `<p>كود الربط: <b style="color:#f59e0b; font-size:18px;">${botStatus.pairingCode}</b></p>` : ''}
+        </div>
 
-app.post('/api/command', (req, res) => {
-    const { command, text } = req.body;
+        <div class="card">
+            <h3>إدارة الحساب</h3>
+            <label>تغيير رقم الهاتف:</label>
+            <input type="text" id="phoneInput" placeholder="مثال: 967775890747">
+            <button class="btn btn-blue" onclick="updatePhone()">تحديث الرقم</button>
+        </div>
 
-    if (command === 'toggle_monitoring') {
-        botStatus.monitoringEnabled = !botStatus.monitoringEnabled;
-        console.log(`[API] حالة المراقبة: ${botStatus.monitoringEnabled}`);
-        return res.json({ success: true, monitoringEnabled: botStatus.monitoringEnabled });
-    }
+        <div class="card">
+            <h3>التحكم بالانضمام والمراقبة</h3>
+            <p>الانضمام التلقائي للمجموعات: <b>${botStatus.monitoringEnabled ? 'مفعل ✅' : 'معطل ❌'}</b></p>
+            <button class="btn ${botStatus.monitoringEnabled ? 'btn-red' : 'btn-green'}" onclick="toggleMonitoring()">
+                ${botStatus.monitoringEnabled ? 'إيقاف الانضمام التلقائي' : 'تشغيل الانضمام التلقائي'}
+            </button>
+        </div>
 
-    if (command === 'broadcast') {
-        console.log(`[API] طلب إرسال نشرة: ${text}`);
-        botStatus.broadcastsCount++;
-        return res.json({ success: true, message: 'جاري تنفيذ النشرة' });
-    }
-
-    res.status(400).json({ success: false, message: 'أمر غير معروف' });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 API Server running on port ${PORT}`);
-});
-
-// ==========================================
-// 2. كود اتصال الواتساب (Baileys ESM)
-// ==========================================
-async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    const { version } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-        version,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"]
-    });
-
-    if (!sock.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
-                let code = await sock.requestPairingCode(botStatus.phoneNumber);
-                code = code?.match(/.{1,4}/g)?.join("-") || code;
-                botStatus.pairingCode = code;
-                
-                console.log("\n========================================");
-                console.log(`📱 الرقم: ${botStatus.phoneNumber}`);
-                console.log(`🔑 كود الربط الخاص بك: ${code}`);
-                console.log("========================================\n");
-            } catch (err) {
-                console.error("فشل في طلب كود الربط:", err);
+        <script>
+            function updatePhone() {
+                const phone = document.getElementById('phoneInput').value;
+                if(!phone) return alert('يرجى إدخال الرقم');
+                fetch('/api/update-phone', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ phoneNumber: phone })
+                }).then(() => location.reload());
             }
-        }, 5000);
-    }
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-
-        if (connection === 'close') {
-            botStatus.connected = false;
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('❌ تم قطع الاتصال، جاري إعادة المحاولة...', shouldReconnect);
-            if (shouldReconnect) {
-                startBot();
+            function toggleMonitoring() {
+                fetch('/api/toggle-monitoring', { method: 'POST' })
+                .then(() => location.reload());
             }
-        } else if (connection === 'open') {
-            botStatus.connected = true;
-            botStatus.pairingCode = null;
-            console.log('✅ تم الاتصال بالواتساب بنجاح!');
-        }
-    });
+        </script>
+    </body>
+    </html>
+    `);
+});
 
-    sock.ev.on('creds.update', saveCreds);
+// 2. واجهات الـ API للتحكم من اللوحة
+app.get('/api/status', (req, res) => res.json(botStatus));
 
-    sock.ev.on('messages.upsert', async (m) => {
-        if (!botStatus.monitoringEnabled) return;
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-    });
-}
+app.post('/api/toggle-monitoring', (req, res) => {
+    botStatus.monitoringEnabled = !botStatus.monitoringEnabled;
+    res.json({ success: true, monitoringEnabled: botStatus.monitoringEnabled });
+});
 
-startBot();
+app.post('/api/update-phone', (req, res) => {
+    const { phoneNumber } = req.body;
+    if (phoneNumber) {
+        botStatus.phoneNumber = phoneNumber;
+        botStatus.connected = false;
+        botStatus.pairingCode = null;
+    }
+    res.json({ success: true, phoneNumber: botStatus.phoneNumber });
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

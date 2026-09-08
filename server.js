@@ -2,6 +2,7 @@ const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBailey
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
+const pino = require('pino');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8851852954:AAFodYLJ-weYJhRya3pauO1UYdktpFZ9FM4';
 const ADMIN_ID = 7640301049;
@@ -36,6 +37,7 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
     const sessionKey = `${chatId}_${accountName}`;
     const sessionDir = path.join(__dirname, 'sessions', sessionKey);
 
+    // تنظيف ملفات الجلسة القديمة الفاسدة
     if (fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -47,10 +49,18 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
         const sock = makeWASocket({
             version,
             auth: state,
+            logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
-            // استخدام بصمة macOS الرسمية لتخطي حظر السيرفرات عند طلب الكود
-            browser: Browsers.macOS("Desktop"),
-            syncFullHistory: false
+            // محاكاة نظام متصفح أوبونتو كروم الرسمي لإتاحة الربط برقم الهاتف
+            browser: ["Ubuntu", "Chrome", "120.0.6099.109"],
+            syncFullHistory: false,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+            emitOwnEvents: true,
+            retryRequestOptions: {
+                maxRetries: 5
+            }
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -74,6 +84,7 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
         });
 
         if (!sock.authState.creds.registered) {
+            // انتظار 3 ثوان لتثبيت استجابة الـ WebSocket قبل طلب الكود
             setTimeout(async () => {
                 try {
                     const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
@@ -81,22 +92,22 @@ async function startWASessionWithCode(chatId, phoneNumber, accountName) {
 
                     bot.sendMessage(
                         chatId,
-                        `📱 **كود الربط المخصص لك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود أعلاه لنسخه مباشرة دون الفواصل)*\n\n⚠️ **تنبيه:** أدخل الكود في الواتساب فوراً.`,
+                        `📱 **كود الربط المخصص لك:**\n\n\`${pairingCode}\`\n\n*(اضغط على الكود أعلاه لنسخه فوراً)*\n\n⚠️ **تنبيه هام جداً:**\n1. افتح تطبيق الواتساب فوراً.\n2. اختر **الأجهزة المرتبطة** > **ربط جهاز** > **الربط برقم الهاتف**.\n3. قم بلصق الكود فوراً بدون تعديل أو تأخير.`,
                         { parse_mode: 'Markdown', ...cancelKeyboard }
                     );
                 } catch (err) {
                     bot.sendMessage(
                         chatId, 
-                        `❌ **تعذر إصدار الكود:**\n\`${err.message || err}\`\n\nيرجى التأكد من كتابة الرقم صحيحة بالرمز الدولي.`,
+                        `❌ **خطأ من واتساب عند طلب الكود:**\n\`${err.message || err}\`\n\nيرجى التأكد من أن الرقم بدون مسافات أو رموز وأن حسابك ليس محظوراً مؤقتاً من الربط.`,
                         { parse_mode: 'Markdown', reply_markup: getMainKeyboard(chatId) }
                     );
                 }
-            }, 2000);
+            }, 3000);
         }
 
         waSessions[sessionKey] = sock;
     } catch (e) {
-        bot.sendMessage(chatId, `⚠️ **خطأ بالنظام:**\n\`${e.message}\``, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `⚠️ **خطأ في السيرفر:**\n\`${e.message}\``, { parse_mode: 'Markdown' });
     }
 }
 
@@ -161,7 +172,7 @@ bot.on('message', async (msg) => {
 
         bot.sendMessage(
             chatId, 
-            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...`, 
+            `🔄 **جاري جلب كود الربط للرقم:** \`${text}\`...\nجهز تطبيق الواتساب على هاتفك الآن!`, 
             { parse_mode: 'Markdown', ...cancelKeyboard }
         );
         startWASessionWithCode(chatId, text, accId);
@@ -188,7 +199,7 @@ bot.on('callback_query', async (query) => {
         userStates[chatId] = 'AWAITING_PHONE';
         bot.sendMessage(
             chatId, 
-            "📞 **يرجى إرسال رقم الواتساب الخاص بك مع رمز الدولة:**\n\nمثال: `966500000000` أو `96770000000`", 
+            "📞 **يرجى إرسال رقم الواتساب الخاص بك مع رمز الدولة دون (+):**\n\nمثال: `966500000000` أو `96770000000`", 
             { parse_mode: 'Markdown', ...cancelKeyboard }
         );
     } else if (data === "menu_accounts") {
@@ -208,7 +219,7 @@ bot.on('callback_query', async (query) => {
         ]);
         buttons.push([{ text: "❌ إلغاء العمليّة", callback_data: "cancel_action" }]);
 
-        bot.sendMessage(chatId, "📱 **حسابات الواتساب الخاصة بك:**\nاختر حساً للتحكم به أو حذفه:", {
+        bot.sendMessage(chatId, "📱 **حسابات الواتساب الخاصة بك:**\nاختر حسابتً للتحكم به أو حذفه:", {
             parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: buttons }
         });
@@ -216,13 +227,11 @@ bot.on('callback_query', async (query) => {
         const accToDelete = data.replace("delete_", "");
         bot.answerCallbackQuery(query.id, { text: `جاري حذف الحساب ${accToDelete}...` });
 
-        // حذف الحساب من قاعدة البيانات
         if (db.userAccounts[chatId]) {
             db.userAccounts[chatId] = db.userAccounts[chatId].filter(acc => acc !== accToDelete);
             saveDB();
         }
 
-        // إغلاق الجلسة ومسح المجلد
         const sessionKey = `${chatId}_${accToDelete}`;
         if (waSessions[sessionKey]) {
             try { waSessions[sessionKey].end(); } catch (e) {}
@@ -234,13 +243,13 @@ bot.on('callback_query', async (query) => {
             fs.rmSync(sessionDir, { recursive: true, force: true });
         }
 
-        bot.sendMessage(chatId, `🗑️ **تم حذف الحساب [${accToDelete}] ومسح كل بياناته بنجاح.**`, {
+        bot.sendMessage(chatId, `🗑️ **تم حذف الحساب [${accToDelete}] ومسح الجلسة بنجاح.**`, {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
     } else if (data === "menu_status") {
         bot.answerCallbackQuery(query.id);
-        bot.sendMessage(chatId, "⚙️ **حالة الخدمة:** تعمل واستجابة السيرفر متصلة.", {
+        bot.sendMessage(chatId, "⚙️ **حالة الخدمة:** تعمل بنجاح.", {
             parse_mode: 'Markdown',
             reply_markup: getMainKeyboard(chatId)
         });
